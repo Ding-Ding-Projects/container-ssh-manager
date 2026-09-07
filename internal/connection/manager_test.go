@@ -58,3 +58,16 @@ func TestSameOriginRequiresExactHost(t *testing.T) {
 		t.Fatal("exact origin rejected")
 	}
 }
+
+func TestParseSSHConfigReportsUnsupportedDirectives(t *testing.T) {
+	r := ParseSSHConfig("Host jump\n HostName jump.example\n User admin\nHost app\n HostName app.example\n Port 2200\n ProxyJump jump\n IdentityFile ~/.ssh/id\n")
+	if len(r.Hosts) != 2 {
+		t.Fatalf("hosts: %#v", r.Hosts)
+	}
+	if r.Hosts[1].Port != 2200 || len(r.Hosts[1].JumpIDs) != 1 || r.Hosts[1].JumpIDs[0] != "jump" {
+		t.Fatalf("app: %#v", r.Hosts[1])
+	}
+	if len(r.Unsupported) != 1 || r.Unsupported[0].Name != "IdentityFile" {
+		t.Fatalf("unsupported: %#v", r.Unsupported)
+	}
+}
