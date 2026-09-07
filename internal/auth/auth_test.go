@@ -38,6 +38,27 @@ func TestProxyIdentityAndAttemptIsolation(t *testing.T) {
 	}
 }
 
+func TestAdministrativeRoutesRequireSession(t *testing.T) {
+	s, e := core.NewStore(filepath.Join(t.TempDir(), "auth.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	a := New(s, "https://manager.test")
+	h := a.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("unauthenticated request reached inner handler") }))
+	for _, path := range []string{"/api/v1/hosts", "/api/v1/hosts/example/terminal", "/api/v1/credentials", "/api/v1/tunnels", "/api/v1/engine/containers", "/api/v1/engine/compose/projects/example/files", "/api/v1/jobs/runs/example/output", "/api/v1/jobs/schedules", "/api/v1/jobs/audit"} {
+		for _, method := range []string{"GET", "POST", "PUT", "DELETE"} {
+			r := httptest.NewRequest(method, path, nil)
+			r.Header.Set("Origin", "https://manager.test")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != 401 {
+				t.Fatalf("%s %s returned %d", method, path, w.Code)
+			}
+		}
+	}
+}
+
 func TestOwnerAndOriginBoundaries(t *testing.T) {
 	s, e := core.NewStore(filepath.Join(t.TempDir(), "test.db"))
 	if e != nil {

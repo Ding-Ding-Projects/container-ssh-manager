@@ -158,7 +158,7 @@ func run() error {
 	j.Register(mux)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	j.Start(ctx)
+	go j.Start(ctx)
 	frontend, e := fs.Sub(assets.Files, "dist")
 	if e != nil {
 		return e
