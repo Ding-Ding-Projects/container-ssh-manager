@@ -69,6 +69,10 @@ func (m *Manager) docker(w http.ResponseWriter, r *http.Request, path string) {
 		m.execContainer(w, r, hostID, parts[1], body)
 		return
 	}
+	if len(parts) == 3 && parts[0] == "containers" && parts[2] == "recreate" && r.Method == http.MethodPost {
+		m.recreateContainer(w, r, hostID, parts[1])
+		return
+	}
 	apiPath, method, stream, err := dockerRoute(r.Method, parts, r.URL.Query())
 	if err != nil {
 		core.Error(w, 400, err.Error())
@@ -144,7 +148,12 @@ func (m *Manager) engineJSON(ctx context.Context, hostID, method, path string, b
 	if err != nil {
 		return nil, 502, err
 	}
-	u.Path = strings.TrimSuffix(u.Path, "/") + path
+	rel, err := url.Parse(path)
+	if err != nil {
+		return nil, 500, err
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + rel.Path
+	u.RawQuery = rel.RawQuery
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, 500, err
@@ -176,7 +185,13 @@ func (m *Manager) proxy(w http.ResponseWriter, r *http.Request, hostID, method, 
 		core.Error(w, 502, "invalid engine transport")
 		return
 	}
-	u.Path = strings.TrimSuffix(u.Path, "/") + apiPath
+	rel, err := url.Parse(apiPath)
+	if err != nil {
+		core.Error(w, 500, "invalid engine API path")
+		return
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + rel.Path
+	u.RawQuery = rel.RawQuery
 	req, err := http.NewRequestWithContext(r.Context(), method, u.String(), bytes.NewReader(body))
 	if err != nil {
 		core.Error(w, 500, "cannot create engine request")
