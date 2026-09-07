@@ -1,7 +1,10 @@
 package connection
 
 import (
+	"context"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -13,6 +16,24 @@ func TestSafeRemotePath(t *testing.T) {
 	}
 	if err := safeRemotePath("/var/log/app.log"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWriteComposeFileLocal(t *testing.T) {
+	dir := t.TempDir()
+	m := &Manager{}
+	if err := m.WriteComposeFile(context.Background(), "local", dir, "compose.yaml", []byte("services: {}\n")); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "services: {}\n" {
+		t.Fatalf("got %q", b)
+	}
+	if err := m.WriteComposeFile(context.Background(), "local", dir, "bad.yaml", []byte("x")); err == nil {
+		t.Fatal("unsafe basename accepted")
 	}
 }
 
