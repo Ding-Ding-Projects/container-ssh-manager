@@ -3,7 +3,21 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": { "dev": "vite", "build": "tsc -b && vite build", "test": "vitest run" },
-  "dependencies": { "@material/web": "2.3.0", "@xterm/xterm": "5.5.0", "@xterm/addon-fit": "0.10.0" },
-  "devDependencies": { "@types/node": "22.10.5", "typescript": "5.7.2", "vite": "6.0.3", "vitest": "2.1.8" }
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@material/web": "2.3.0",
+    "@xterm/addon-fit": "0.10.0",
+    "@xterm/xterm": "5.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "happy-dom": "20.14.0",
+    "typescript": "5.7.2",
+    "vite": "8.2.2",
+    "vitest": "5.0.0"
+  }
 }

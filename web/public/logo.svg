@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Container SSH Manager">
+  <rect width="64" height="64" rx="18" fill="#204779"/>
+  <path d="M15 22h34v25H15z" fill="#d6e3ff"/>
+  <path d="M15 22l9-8h25v8M25 22v25m12-25v25" fill="none" stroke="#a8c7fa" stroke-width="3" stroke-linejoin="round"/>
+  <rect x="9" y="32" width="32" height="22" rx="5" fill="#101419" stroke="#a8c7fa" stroke-width="2"/>
+  <path d="m16 38 5 5-5 5m10 0h7" fill="none" stroke="#d6e3ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

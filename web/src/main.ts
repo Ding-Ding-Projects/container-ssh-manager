@@ -1,23 +1,533 @@
-import '@material/web/all.js'; import './style.css'; import {esc,query,cronValid,positive} from './core';
-type H={id:string,name:string,address:string,user:string,port:number};type P='overview'|'hosts'|'containers'|'compose'|'images'|'volumes'|'networks'|'files'|'tunnels'|'commands'|'schedules'|'settings';let s={p:'overview' as P,hs:[] as H[],h:'',items:[] as any[],snips:[] as any[],sched:[] as any[]};const ps:P[]=['overview','hosts','containers','compose','images','volumes','networks','files','tunnels','commands','schedules','settings'];const a=async<T>(u:string,i?:RequestInit)=>{let r=await fetch(u,{credentials:'same-origin',headers:{'Content-Type':'application/json',...(i?.headers||{})},...i});if(!r.ok)throw Error((await r.json().catch(()=>({error:r.statusText}))).error);return r.status===204?undefined as T:await r.json()};const g=(x:string)=>(document.querySelector('#'+x)as any)?.value?.trim()||'';const host=()=>s.hs.find(x=>x.id===s.h);const say=(x:string)=>{let n=document.querySelector('md-snackbar')as any;n.labelText=x;n.open=true};const btn=(id:string,t:string)=>`<md-filled-button id="${id}">${t}</md-filled-button>`;const field=(id:string,l:string,v='')=>`<md-outlined-text-field id="${id}" label="${l}" value="${esc(v)}"></md-outlined-text-field>`;
-function shell(){document.querySelector('#app')!.innerHTML=`<div class="shell"><header class="topbar"><div class="brand"><md-icon>terminal</md-icon>Container SSH Manager</div><md-icon-button id="logout" aria-label="Log out"><md-icon>logout</md-icon></md-icon-button></header><aside class="nav"><div class="host-head">Hosts ${btn('add-host','Add')}</div>${s.hs.map(h=>`<button class="host ${h.id===s.h?'selected':''}" data-h="${h.id}">${esc(h.name)}<small>${esc(h.address)}</small></button>`).join('')||'<p>No hosts yet</p>'}<md-divider></md-divider>${ps.map(p=>`<button class="nav-item ${p===s.p?'active':''}" data-p="${p}">${p}</button>`).join('')}</aside><main><section class="content">${view()}</section></main></div><md-dialog id="d"><div slot="headline" id="dt"></div><form slot="content" id="dc"></form><div slot="actions"><md-text-button value="cancel">Cancel</md-text-button><md-filled-button value="confirm">Confirm</md-filled-button></div></md-dialog><md-snackbar></md-snackbar>`;bind()}
-const chosen=()=>host()?`<span class="target">${esc(host()!.name)} · ${esc(host()!.user)}@${esc(host()!.address)}</span>`:'';function noHost(){return `<div class="empty"><h1>Select a host</h1><p>Every engine and SSH action requires a stored host.</p></div>`}function section(t:string,b:string){return `<section class="surface"><h2>${t}</h2>${b}</section>`}
-function view(){if(s.p==='overview')return `<h1>Overview</h1>${chosen()}<p>${s.hs.length} stored hosts. Select one to use live controls.</p>`;if(s.p==='hosts')return hosts();if(!host())return noHost();if(s.p==='containers')return resources('Containers','containers');if(s.p==='images')return resources('Images','images');if(s.p==='volumes')return resources('Volumes','volumes');if(s.p==='networks')return resources('Networks','networks');if(s.p==='compose')return compose();if(s.p==='commands')return commands();if(s.p==='files')return files();if(s.p==='tunnels')return tunnels();if(s.p==='schedules')return schedules();return `<h1>Settings</h1>${section('Local preferences',field('language','Language','English')+field('theme','Theme','System'))}`}
-function hosts(){return `<h1>Hosts</h1><div class="records">${s.hs.map(h=>section(esc(h.name),`<p>${esc(h.user)}@${esc(h.address)}:${h.port}</p>${btn('test-'+h.id,'Test and enroll key')} <md-text-button data-delhost="${h.id}">Remove</md-text-button>`)).join('')}</div>`}
-function resources(name:string,k:string){return `<h1>${name}</h1>${chosen()}<p>${btn('load','Refresh live data')} ${btn('create','Create or add')}</p><div class="records">${s.items.map(x=>{let id=x.Id||x.ID||x.id||x.Name||x.name,n=x.Names?.[0]||x.Name||x.name||id;return section(esc(String(n).replace('/','')),`<p>${esc(String(x.State||x.status||''))}</p>${k==='containers'?`<md-outlined-button data-op="start" data-id="${id}">Start</md-outlined-button><md-outlined-button data-op="stop" data-id="${id}">Stop</md-outlined-button><md-outlined-button data-op="restart" data-id="${id}">Restart</md-outlined-button><md-text-button data-op="remove" data-id="${id}">Remove</md-text-button><md-text-button data-op="logs" data-id="${id}">Logs</md-text-button><md-text-button data-op="exec" data-id="${id}">Exec</md-text-button>`:k==='networks'?`<md-outlined-button data-op="connect" data-id="${id}">Connect</md-outlined-button><md-text-button data-op="remove" data-id="${id}">Remove</md-text-button>`:k==='images'?`<md-outlined-button data-op="tag" data-id="${id}">Tag</md-outlined-button><md-text-button data-op="remove" data-id="${id}">Remove</md-text-button>`:`<md-text-button data-op="remove" data-id="${id}">Remove</md-text-button>`}`)}).join('')||'<p>No records loaded yet.</p>'}</div>`}
-function compose(){return `<h1>Compose projects</h1>${chosen()}${btn('load-compose','Refresh')} ${btn('create-compose','Add or adopt project')}<div class="records">${s.items.map(x=>section(esc(x.name||x.id),`<p>${esc(x.path||'')}</p><md-outlined-button data-compose="edit" data-id="${x.id}">Edit files</md-outlined-button><md-filled-button data-compose="deploy" data-id="${x.id}">Deploy</md-filled-button><md-text-button data-compose="stop" data-id="${x.id}">Stop</md-text-button><md-text-button data-compose="down" data-id="${x.id}">Down</md-text-button>`)).join('')||'<p>No projects loaded.</p>'}</div>`}
-function commands(){return `<h1>Commands</h1>${chosen()}${section('Direct command',`<md-outlined-text-field id="cmd" label="Command" type="textarea" rows="4"></md-outlined-text-field>${btn('run','Run selected host command')}`)}${section('Saved snippets',`${btn('load-snips','Refresh snippets')} ${btn('new-snip','New snippet')}<div class="records">${s.snips.map(x=>`<p><b>${esc(x.name)}</b> ${btn('run-'+x.id,'Run') } <md-text-button data-delsnip="${x.id}">Delete</md-text-button></p>`).join('')}</div>`)}`}
-function files(){return `<h1>Files</h1>${chosen()}${section('Browse, download, and edit',`${field('path','Remote path','/')}${btn('browse','Browse')}<input id="upload" type="file" aria-label="Upload file"><div id="entries"></div><div id="edit"></div>`)}`}
-function tunnels(){return `<h1>Tunnels</h1>${chosen()}${section('Create tunnel',`${field('direction','Direction','local')}${field('listen','Listen address','127.0.0.1')}${field('lport','Listen port')}${field('target','Target address')}${field('tport','Target port')}${btn('tunnel','Create tunnel')} ${btn('load-tunnels','Refresh tunnels')}<div id="tun"></div>`)}`}
-function schedules(){return `<h1>Schedules and runs</h1>${chosen()}${section('Schedules',`${btn('load-sched','Refresh schedules')} ${btn('new-sched','New AUTOAPPROVED schedule')}<div class="records">${s.sched.map(x=>`<p>${esc(x.cron)} ${x.enabled?'enabled':'disabled'} <md-text-button data-delsched="${x.id}">Delete</md-text-button></p>`).join('')}</div>`)}${section('Runs',`${btn('load-runs','Refresh runs')}<div id="runs"></div>`)}`}
-function dialog(t:string,b:string,ok:()=>Promise<void>){let d=document.querySelector('#d')as any;(document.querySelector('#dt')!).textContent=t;(document.querySelector('#dc')!).innerHTML=b;d.addEventListener('close',()=>d.returnValue==='confirm'&&ok(),{once:true});d.show()}
-async function load(kind:string){try{let u=kind==='containers'?query('/api/v1/engine/containers',{hostId:s.h,all:true}):kind==='images'?query('/api/v1/engine/images',{hostId:s.h,all:true}):kind==='volumes'?query('/api/v1/engine/volumes',{hostId:s.h}):query('/api/v1/engine/networks',{hostId:s.h});s.items=await a<any[]>(u);shell()}catch(e){say((e as Error).message)}}
-function bind(){document.querySelectorAll('[data-p]').forEach(x=>x.addEventListener('click',()=>{s.p=(x as HTMLElement).dataset.p as P;s.items=[];shell()}));document.querySelectorAll('[data-h]').forEach(x=>x.addEventListener('click',()=>{s.h=(x as HTMLElement).dataset.h!;shell()}));document.querySelector('#add-host')?.addEventListener('click',()=>dialog('Add host',field('name','Name')+field('address','Address')+field('port','Port','22')+field('user','User')+`<md-outlined-text-field id="secret" label="Credential secret" type="password"></md-outlined-text-field>`,async()=>{let c=await a<any>('/api/v1/credentials',{method:'POST',body:JSON.stringify({name:g('name')+' credential',kind:'password',secret:g('secret')})});let h=await a<H>('/api/v1/hosts',{method:'POST',body:JSON.stringify({name:g('name'),address:g('address'),port:+g('port'),user:g('user'),credentialId:c.id,jumpIds:[],tags:[]})});s.hs.push(h);s.h=h.id;shell()}));document.querySelector('#load')?.addEventListener('click',()=>load(s.p));document.querySelector('#create')?.addEventListener('click',()=>createResource(s.p));document.querySelectorAll('[data-op]').forEach(x=>x.addEventListener('click',()=>operate((x as HTMLElement).dataset.op!,(x as HTMLElement).dataset.id!)));document.querySelector('#load-compose')?.addEventListener('click',async()=>{s.items=await a('/api/v1/engine/compose/projects');shell()});document.querySelector('#create-compose')?.addEventListener('click',()=>dialog('Add Compose project',field('project','Project name')+field('project-path','Absolute project path'),async()=>{ await a('/api/v1/engine/compose/projects',{method:'POST',body:JSON.stringify({hostId:s.h,name:g('project'),path:g('project-path'),adopt:true})}); }));document.querySelectorAll('[data-compose]').forEach(x=>x.addEventListener('click',()=>composeOp((x as HTMLElement).dataset.compose!,(x as HTMLElement).dataset.id!)));document.querySelector('#run')?.addEventListener('click',async()=>{let r=await a<any>(`/api/v1/hosts/${s.h}/run`,{method:'POST',body:JSON.stringify({command:g('cmd')})});say('Exit code '+r.exitCode)});document.querySelector('#load-snips')?.addEventListener('click',loadSnips);document.querySelector('#new-snip')?.addEventListener('click',newSnip);document.querySelector('#browse')?.addEventListener('click',browse);document.querySelector('#upload')?.addEventListener('change',upload);document.querySelector('#tunnel')?.addEventListener('click',newTunnel);document.querySelector('#load-tunnels')?.addEventListener('click',loadTunnels);document.querySelector('#load-sched')?.addEventListener('click',loadSchedules);document.querySelector('#new-sched')?.addEventListener('click',newSchedule);document.querySelector('#load-runs')?.addEventListener('click',loadRuns);document.querySelector('#logout')?.addEventListener('click',()=>a('/api/v1/logout',{method:'POST'}).then(()=>location.reload()))}
-async function createResource(k:string){let body=k==='containers'?field('image','Image reference')+field('container','Container name'):k==='images'?field('reference','Image reference')+field('platform','Platform (optional)'):k==='volumes'?field('volume','Volume name')+field('driver','Driver','local'):field('network','Network name')+field('driver','Driver','bridge');dialog('Create '+k,body,async()=>{let url=k==='containers'?'/api/v1/engine/containers':k==='images'?'/api/v1/engine/images/pull':k==='volumes'?'/api/v1/engine/volumes':'/api/v1/engine/networks';let b=k==='containers'?{hostId:s.h,name:g('container'),config:{Image:g('image')},hostConfig:{}}:k==='images'?{hostId:s.h,reference:g('reference'),platform:g('platform')||undefined}:k==='volumes'?{hostId:s.h,name:g('volume'),driver:g('driver')}:{hostId:s.h,name:g('network'),driver:g('driver')};await a(url,{method:'POST',body:JSON.stringify(b)});await load(k)})}
-async function operate(op:string,id:string){if(op==='logs'){let text=await fetch(query(`/api/v1/engine/containers/${id}/logs`,{hostId:s.h,stdout:true,stderr:true,tail:200,timestamps:false})).then(r=>r.text());return dialog('Container logs',`<pre>${esc(text)}</pre>`,async()=>{})}if(op==='exec')return dialog('Execute in container',field('exec','Command'),async()=>{await a(`/api/v1/engine/containers/${id}/exec`,{method:'POST',body:JSON.stringify({hostId:s.h,cmd:g('exec').split(/\s+/)})});say('Execution requested')});if(op==='connect')return dialog('Connect container',field('connect-container','Container ID'),async()=>{await a(`/api/v1/engine/networks/${id}/connect`,{method:'POST',body:JSON.stringify({hostId:s.h,container:g('connect-container')})})});let base=s.p==='containers'?`/api/v1/engine/containers/${id}/${op}`:`/api/v1/engine/${s.p}/${id}`;if(op==='remove')return dialog('Confirm removal',`<p>This action can remove live data. Type REMOVE to continue.</p>${field('confirm','Confirmation')}`,async()=>{if(g('confirm')!=='REMOVE')throw Error('Confirmation did not match');await a(query(base,{hostId:s.h,force:true,volumes:false,noprune:false}),{method:'DELETE'});await load(s.p)});await a(base,{method:'POST',body:JSON.stringify({hostId:s.h})});await load(s.p)}
-async function composeOp(op:string,id:string){if(op==='edit')return dialog('Edit Compose files',`<md-outlined-text-field id="compose-file" label="Compose YAML" type="textarea" rows="12"></md-outlined-text-field>`,async()=>{await a(`/api/v1/engine/compose/projects/${id}/files`,{method:'PUT',body:JSON.stringify({compose:g('compose-file')})})});await a(`/api/v1/engine/compose/projects/${id}/${op}`,{method:'POST',body:JSON.stringify(op==='deploy'?{pull:true,build:false,detach:true}:{})});say('Compose operation requested')}
-async function loadSnips(){s.snips=await a('/api/v1/jobs/snippets');shell()}function newSnip(){dialog('New snippet',field('snip-name','Name')+field('snip-command','Command'),async()=>{await a('/api/v1/jobs/snippets',{method:'POST',body:JSON.stringify({name:g('snip-name'),command:g('snip-command'),retention:{enabled:false}})});await loadSnips()})}
-async function browse(){let path=g('path')||'/';let x=await a<any[]>(query(`/api/v1/hosts/${s.h}/files`,{path}));(document.querySelector('#entries')!).innerHTML=x.map((i:any)=>`<p>${esc(i.name||i.path)}</p>`).join('')}async function upload(e:Event){let f=(e.target as HTMLInputElement).files?.[0];if(f)await fetch(query(`/api/v1/hosts/${s.h}/files/upload`,{path:(g('path')||'/')+'/'+f.name}),{method:'POST',credentials:'same-origin',body:f})}
-async function newTunnel(){if(!positive(g('lport'))||!positive(g('tport')))return say('Ports must be positive integers');await a('/api/v1/tunnels',{method:'POST',body:JSON.stringify({hostId:s.h,direction:g('direction'),listenAddress:g('listen'),listenPort:+g('lport'),targetAddress:g('target'),targetPort:+g('tport')})})}async function loadTunnels(){let x=await a<any[]>('/api/v1/tunnels');(document.querySelector('#tun')!).innerHTML=x.map((t:any)=>`<p>${esc(t.id)} ${esc(t.state||'')}</p>`).join('')}
-async function loadSchedules(){s.sched=await a('/api/v1/jobs/schedules');shell()}function newSchedule(){dialog('New AUTOAPPROVED schedule',field('cron','Five-field cron','0 3 * * *')+field('snippet','Snippet ID')+field('revision','Revision ID'),async()=>{if(!cronValid(g('cron')))throw Error('Cron must have five fields');await a('/api/v1/jobs/schedules',{method:'POST',body:JSON.stringify({hostId:s.h,snippetId:g('snippet'),revisionId:g('revision'),cron:g('cron'),enabled:true})});await loadSchedules()})}async function loadRuns(){let x=await a<any[]>(query('/api/v1/jobs/runs',{hostId:s.h}));let e=document.querySelector('#runs');if(e)e.innerHTML=x.map((r:any)=>`<p>${esc(r.id)} ${esc(r.status||'')}</p>`).join('')}
-async function init(){try{let q=await a<any>('/api/v1/session');if(!q.authenticated)return location.href='/login';s.hs=await a('/api/v1/hosts');s.h=s.hs.find(x=>x.id==='local')?.id||s.hs[0]?.id||'';shell()}catch{location.href='/login'}}init();
+import "./style.css";
+import { APIError, list, request } from "./api";
+import { state, Host, t, applyPreferences, savePreferences } from "./state";
+import {
+  button,
+  dialog,
+  el,
+  field,
+  notify,
+  panel,
+  row,
+  select,
+  stack,
+  refreshLocalizedControls,
+} from "./ui";
+import { enginePage, composePage } from "./engine";
+import { hostsPage, filesPage, tunnelsPage } from "./connections";
+import { commandsPage, schedulesPage, runsPage } from "./jobs";
+import { terminalView, TerminalView } from "./terminal";
+const app = document.querySelector<HTMLElement>("#app")!;
+const notifications = el("div", "", "notifications");
+notifications.id = "notifications";
+notifications.setAttribute("aria-live", "polite");
+document.body.append(notifications);
+const pages = [
+  "Overview",
+  "Hosts",
+  "Containers",
+  "Compose",
+  "Images",
+  "Volumes",
+  "Networks",
+  "Terminal",
+  "Files",
+  "Tunnels",
+  "Commands",
+  "Schedules",
+  "Jobs",
+  "Settings",
+];
+const hostPages = new Set([
+  "Containers",
+  "Compose",
+  "Images",
+  "Volumes",
+  "Networks",
+  "Terminal",
+  "Files",
+  "Tunnels",
+]);
+type Tab = {
+  id: number;
+  page: string;
+  hostId: string;
+  node: HTMLElement;
+  terminal?: TerminalView;
+};
+let tabs: Tab[] = [],
+  activeId = 0,
+  nextId = 1,
+  version = { version: "Unavailable", updatedAt: "" },
+  shellNode: HTMLElement,
+  nav: HTMLElement,
+  content: HTMLElement,
+  tabstrip: HTMLElement;
+function versionLine(): HTMLElement {
+  let time = "Updated: unavailable";
+  const date = new Date(version.updatedAt);
+  if (version.updatedAt && Number.isFinite(date.valueOf()))
+    time =
+      "Updated: " +
+      date.toLocaleString(undefined, {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        timeZoneName: "short",
+      });
+  return el(
+    "div",
+    `Version ${version.version || "unavailable"} · ${time}`,
+    "version",
+  );
+}
+function appMark():HTMLImageElement{const mark=el('img');mark.src='/logo.svg';mark.alt='Container SSH Manager';mark.width=40;mark.height=40;mark.className='app-mark';return mark;}
+async function reloadHosts(): Promise<void> {
+  state.hosts = list<Host>(await request("/api/v1/hosts"));
+  if (!state.hosts.some((h) => h.id === state.hostId))
+    state.hostId =
+      state.hosts.find((h) => h.id === "local")?.id || state.hosts[0]?.id || "";
+  if (nav) renderNav();
+}
+function login(): void {
+  tabs.forEach((tab) => tab.terminal?.dispose());
+  tabs = [];
+  applyPreferences();
+  const password = field("Owner password", "", "password"),
+    error = el("p", "", "form-error");
+  password.autocomplete = "current-password";
+  let signingIn = false;
+  const submit = async () => {
+    if (signingIn) return;
+    signingIn = true;
+    try {
+      const value = password.value;
+      password.value = "";
+      await request("/api/v1/login", "POST", { password: value });
+      await reloadHosts();
+      shell();
+      await openPage("Overview");
+    } catch (e) {
+      error.textContent = e instanceof Error ? e.message : String(e);
+      password.focus();
+    } finally {
+      signingIn = false;
+    }
+  };
+  password.addEventListener("keydown", (event: KeyboardEvent) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void submit();
+    }
+  });
+  const card = panel(
+    "Container SSH Manager",
+    versionLine(),
+    el("h1", "Sign in"),
+    el(
+      "p",
+      "Manage containers and SSH hosts from one authenticated workspace.",
+    ),
+    password,
+    error,
+    button("Sign in", submit, true),
+  );
+  card.classList.add("login");
+  card.prepend(appMark());
+  app.replaceChildren(card);
+  setTimeout(() => password.focus(), 0);
+}
+function shell(): void {
+  shellNode = el("div", "", "shell");
+  nav = el("aside", "", "navigation");
+  nav.setAttribute("aria-label", "Hosts and navigation");
+  content = el("main", "", "main");
+  tabstrip = el("div", "", "tabstrip");
+  tabstrip.setAttribute("role", "tablist");
+  const menu = button("Menu", () => {
+    shellNode.classList.toggle("nav-open");
+  });
+  menu.id = "menu-toggle";
+  const header = el("header", "", "topbar");
+  header.append(
+    row(menu, appMark(), el("strong", "Container SSH Manager")),
+    versionLine(),
+    row(
+      button("Jobs", async () => dialog("Jobs", await runsPage())),
+      button("Settings", () => openPage("Settings")),
+      button("Command palette", () => commandPalette()),
+      button("Sign out", async () => {
+        await request("/api/v1/logout", "POST");
+        login();
+      }),
+    ),
+  );
+  shellNode.append(header, nav, stack(tabstrip, content));
+  shellNode.lastElementChild!.classList.add("workspace");
+  app.replaceChildren(shellNode);
+  renderNav();
+  renderTabs();
+}
+function renderNav(): void {
+  nav.replaceChildren();
+  const hostSelect = select(
+    t("Select a host"),
+    state.hosts.map((h) => ({ value: h.id, label: h.name })),
+    state.hostId,
+  );
+  hostSelect.addEventListener("change", () => {
+    state.hostId = hostSelect.value;
+    const page = tabs.find((tab) => tab.id === activeId)?.page || "Overview";
+    void openPage(page).catch((e) => notify(e.message, true));
+  });
+  const search = field("Search"),
+    links = stack();
+  const draw = () => {
+    links.replaceChildren(
+      ...pages
+        .filter((page) =>
+          t(page).toLowerCase().includes(search.value.toLowerCase()),
+        )
+        .map((page) => button(page, () => openPage(page))),
+    );
+  };
+  search.addEventListener("input", draw);
+  draw();
+  nav.append(
+    el("div", "WORKSPACE", "eyebrow"),
+    hostSelect,
+    button("Add host", () => openPage("Hosts")),
+    search,
+    links,
+  );
+}
+function commandPalette(): void {
+  const search = field("Search"),
+    results = stack();
+  let popup: any;
+  const draw = () => {
+    results.replaceChildren(
+      ...pages
+        .filter((page) =>
+          t(page).toLowerCase().includes(search.value.toLowerCase()),
+        )
+        .map((page) =>
+          button(t(page), async () => {
+            popup.close();
+            await openPage(page);
+          }),
+        ),
+    );
+  };
+  search.addEventListener("input", draw);
+  draw();
+  popup = dialog("Command palette", stack(search, results));
+  setTimeout(() => search.focus(), 0);
+}
+function renderTabs(): void {
+  if (!tabstrip) return;
+  tabstrip.replaceChildren();
+  tabs.forEach((tab) => {
+    const host = state.hosts.find((h) => h.id === tab.hostId),
+      title =
+        t(tab.page) +
+        (hostPages.has(tab.page) && host ? " · " + host.name : "");
+    const activate = button(title, () => activateTab(tab));
+    activate.setAttribute("role", "tab");
+    activate.setAttribute("aria-selected", String(tab.id === activeId));
+    activate.setAttribute("aria-controls", "page-" + tab.id);
+    tabstrip.append(
+      row(
+        activate,
+        button("×", () => {
+          const closeTab = () => {
+            tab.terminal?.dispose();
+            tab.node.remove();
+            tabs = tabs.filter((t) => t.id !== tab.id);
+            if (activeId === tab.id) {
+              if (tabs.length) activateTab(tabs.at(-1)!);
+              else void openPage("Overview");
+            }
+            renderTabs();
+          };
+          if (tab.terminal || tab.node.querySelector(".wide"))
+            dialog(
+              "Close workspace tab",
+              el(
+                "p",
+                tab.terminal
+                  ? "Closing ends this terminal session and its active process."
+                  : "Unsaved entries in this tab will be lost.",
+              ),
+              closeTab,
+              "Close tab",
+            );
+          else closeTab();
+        }),
+      ),
+    );
+    tabstrip.lastElementChild!.lastElementChild!.setAttribute(
+      "aria-label",
+      "Close " + title,
+    );
+  });
+}
+function activateTab(tab: Tab): void {
+  activeId = tab.id;
+  state.hostId = tab.hostId || state.hostId;
+  tabs.forEach((item) => (item.node.hidden = item.id !== tab.id));
+  renderTabs();
+  renderNav();
+  tab.terminal?.resize();
+  shellNode.classList.remove("nav-open");
+}
+async function openPage(page: string): Promise<void> {
+  if (hostPages.has(page) && !state.hostId) {
+    notify("Add or select a stored host first", true);
+    page = "Hosts";
+  }
+  const hostId = hostPages.has(page) ? state.hostId : "";
+  const existing = tabs.find(
+    (tab) => tab.page === page && tab.hostId === hostId,
+  );
+  if (existing) {
+    activateTab(existing);
+    return;
+  }
+  const tab: Tab = {
+    id: nextId++,
+    page,
+    hostId,
+    node: el("section", "", "page"),
+  };
+  tab.node.id = "page-" + tab.id;
+  tab.node.setAttribute("role", "tabpanel");
+  tab.node.append(el("h1", t(page)), el("p", "Loading live data…"));
+  tabs.push(tab);
+  content.append(tab.node);
+  activateTab(tab);
+  const load = async () => {
+    try {
+      let view: HTMLElement;
+      if(hostId==='local'&&['Files','Tunnels'].includes(page))view=panel('SSH connection required',el('p','The local host is engine-only. Select a stored SSH host to use file transfer or tunnels.'),button('Hosts',()=>openPage('Hosts')));
+      else if (["Containers", "Images", "Volumes", "Networks"].includes(page))
+        view = await enginePage(page.toLowerCase(), hostId);
+      else if (page === "Compose") view = await composePage(hostId);
+      else if (page === "Hosts") view = await hostsPage(reloadHosts);
+      else if (page === "Files") view = await filesPage(hostId);
+      else if (page === "Tunnels") view = await tunnelsPage(hostId);
+      else if (page === "Commands") view = await commandsPage();
+      else if (page === "Schedules") view = await schedulesPage();
+      else if (page === "Jobs") view = await runsPage();
+      else if (page === "Settings") view = settings();
+      else if (page === "Terminal") {
+        if (hostId === "local") {
+          view = panel(
+            "SSH connection required",
+            el(
+              "p",
+              "The local host provides the container engine. Select a stored SSH host for an interactive terminal.",
+            ),
+          );
+        } else {
+          tab.terminal = terminalView(hostId);
+          view = tab.terminal.node;
+        }
+      } else view = overview();
+      if (!tabs.includes(tab)) return;
+      tab.node.replaceChildren(
+        row(
+          el("h1", t(page)),
+          button("Reload view", async () => {
+            tab.terminal?.dispose();
+            await load();
+          }),
+        ),
+        view,
+      );
+      if (hostId) {
+        const host = state.hosts.find((h) => h.id === hostId);
+        tab.node.insertBefore(
+          el(
+            "p",
+            host
+              ? `${host.name} · ${host.id === "local" ? "Local engine" : `${host.user}@${host.address}:${host.port}`}`
+              : hostId,
+            "host-target",
+          ),
+          view,
+        );
+      }
+      if (activeId === tab.id) tab.terminal?.resize();
+    } catch (error) {
+      if (error instanceof APIError && error.status === 401) {
+        login();
+        return;
+      }
+      if (tabs.includes(tab))
+        tab.node.replaceChildren(
+          el("h1", t(page)),
+          panel(
+            "Unable to load",
+            el("p", (error as Error).message),
+            button("Retry", load),
+          ),
+        );
+    }
+  };
+  await load();
+}
+function overview(): HTMLElement {
+  return stack(
+    panel(
+      "Your infrastructure",
+      el(
+        "p",
+        `${state.hosts.length} stored hosts. Choose a host and open a workspace tab to inspect its live resources.`,
+      ),
+      row(
+        button("Hosts", () => openPage("Hosts"), true),
+        button("Containers", () => openPage("Containers")),
+        button("Commands", () => openPage("Commands")),
+      ),
+    ),
+    panel(
+      "Execution and security",
+      el(
+        "p",
+        "Commands run only on selected stored hosts. Schedules pin immutable revisions and disclose AUTOAPPROVED execution. Credential values are write-only; host keys require explicit enrollment.",
+      ),
+    ),
+    panel(
+      "Workspace",
+      el(
+        "p",
+        "Open tabs retain their host context. Terminal reconnects attach to the same in-memory server session. Use the Jobs drawer to inspect outcomes and request cancellation.",
+      ),
+    ),
+  );
+}
+function settings(): HTMLElement {
+  const p = state.preferences,
+    language = select(
+      "Language",
+      [
+        { value: "en", label: "English" },
+        { value: "zh", label: "廣東話" },
+        { value: "both", label: "English + 廣東話" },
+      ],
+      p.language,
+    ),
+    theme = select(
+      "Appearance",
+      [
+        { value: "dark", label: "Dark" },
+        { value: "light", label: "Light" },
+        { value: "system", label: "Follow device" },
+      ],
+      p.theme,
+    ),
+    density = select(
+      "Density",
+      [
+        { value: "comfortable", label: "Comfortable" },
+        { value: "compact", label: "Compact" },
+      ],
+      p.density,
+    ),
+    font = field("Text size (14 to 24 px)", String(p.fontSize), "number");
+  return stack(
+    panel(
+      "Local preferences",
+      language,
+      theme,
+      density,
+      font,
+      button(
+        "Save preferences",
+        () => {
+          const fontSize = Number(font.value);
+          if (!Number.isFinite(fontSize) || fontSize < 14 || fontSize > 24)
+            throw Error("Text size must be 14 to 24 px");
+          const stored = savePreferences({
+            language: language.value,
+            theme: theme.value,
+            density: density.value,
+            fontSize,
+          });
+          renderNav();
+          renderTabs();
+          tabs.forEach((tab) => {
+            const heading = tab.node.querySelector("h1");
+            if (heading) heading.textContent = t(tab.page);
+          });
+          refreshLocalizedControls();
+          notify(
+            stored
+              ? "Preferences saved on this device"
+              : "Preferences applied for this session; browser storage is unavailable.",
+          );
+        },
+        true,
+      ),
+    ),
+    panel(
+      "Build provenance",
+      versionLine(),
+      el(
+        "p",
+        "The version and update time come from the running server build. Missing provenance is reported as unavailable.",
+      ),
+    ),
+  );
+}
+async function init(): Promise<void> {
+  applyPreferences();
+  app.replaceChildren(el("p", "Loading Container SSH Manager…"));
+  try {
+    version = await request("/api/v1/version");
+  } catch {
+    version = { version: "Unavailable", updatedAt: "" };
+  }
+  try {
+    const session = await request("/api/v1/session");
+    if (!session.authenticated) {
+      login();
+      return;
+    }
+    await reloadHosts();
+    shell();
+    await openPage("Overview");
+  } catch (error) {
+    if (error instanceof APIError && error.status === 401) {
+      login();
+      return;
+    }
+    app.replaceChildren(
+      panel(
+        "Unable to connect",
+        versionLine(),
+        el("p", (error as Error).message),
+        button("Retry", init),
+      ),
+    );
+  }
+}
+void init();
+document.addEventListener("keydown", (event: KeyboardEvent) => {
+  if (
+    (event.ctrlKey || event.metaKey) &&
+    event.shiftKey &&
+    event.key.toLowerCase() === "p" &&
+    app.contains(shellNode)
+  ) {
+    event.preventDefault();
+    commandPalette();
+  }
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (state.preferences.theme === "system") applyPreferences();
+});
