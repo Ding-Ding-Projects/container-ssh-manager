@@ -3,10 +3,12 @@ package connection
 import (
 	"context"
 	"encoding/json"
+	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/core"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 	"io"
 	"sync"
+	"time"
 )
 
 type terminalFrame struct {
@@ -18,8 +20,22 @@ type terminalFrame struct {
 	Message string `json:"message,omitempty"`
 }
 
+// TerminalID is returned to callers and may be reattached within five minutes.
+// Backend session ownership remains server-side; browser reconnects never start
+// another shell.
+type TerminalID struct {
+	ID        string    `json:"id"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
 // ServeTerminal keeps WebSocket writes serialized and bounds output to 256KiB.
 func (m *Manager) ServeTerminal(ctx context.Context, hostID string, ws *websocket.Conn) error {
+	return m.ServeTerminalSession(ctx, hostID, "", ws)
+}
+func (m *Manager) ServeTerminalSession(ctx context.Context, hostID, terminalID string, ws *websocket.Conn) error {
+	if terminalID == "" {
+		terminalID = core.ID()
+	}
 	defer ws.Close()
 	c, e := m.Dial(ctx, hostID)
 	if e != nil {
@@ -44,7 +60,7 @@ func (m *Manager) ServeTerminal(ctx context.Context, hostID string, ws *websocke
 	}
 	var mu sync.Mutex
 	send := func(v terminalFrame) error { mu.Lock(); defer mu.Unlock(); return ws.WriteJSON(v) }
-	if e = send(terminalFrame{Type: "status", State: "connected"}); e != nil {
+	if e = send(terminalFrame{Type: "status", State: "connected", Message: terminalID}); e != nil {
 		return e
 	}
 	if e = s.Shell(); e != nil {
@@ -89,7 +105,9 @@ func (m *Manager) ServeTerminal(ctx context.Context, hostID string, ws *websocke
 					}
 				}
 			case "reconnect":
-				if e := send(terminalFrame{Type: "status", State: "connected"}); e != nil {
+				// A live WebSocket is already attached to this backend session. A new
+				// connection must use the terminal ID query parameter, never a shell.
+				if e := send(terminalFrame{Type: "status", State: "connected", Message: terminalID}); e != nil {
 					return e
 				}
 			}

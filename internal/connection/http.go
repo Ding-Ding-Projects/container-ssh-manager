@@ -1,7 +1,6 @@
 package connection
 
 import (
-	"context"
 	"errors"
 	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/core"
 	"github.com/gorilla/websocket"
@@ -225,7 +224,7 @@ func (m *Manager) terminalHandler(w http.ResponseWriter, r *http.Request, id str
 	if e != nil {
 		return
 	}
-	if e = m.ServeTerminal(context.Background(), id, ws); e != nil {
+	if e = m.ServeTerminalSession(r.Context(), id, r.URL.Query().Get("session"), ws); e != nil {
 		_ = ws.WriteJSON(terminalFrame{Type: "status", State: "closed", Message: e.Error()})
 	}
 }
