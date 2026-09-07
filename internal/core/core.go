@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -104,6 +105,16 @@ func NewVault(key []byte) (*Vault, error) {
 	return &Vault{a}, e
 }
 func LoadVault(path string) (*Vault, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("vault key unavailable: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("vault key must be a regular file, not a link")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
+		return nil, errors.New("vault key permissions must be owner-only")
+	}
 	key, e := os.ReadFile(path)
 	if e != nil {
 		return nil, fmt.Errorf("vault key unavailable: %w", e)
@@ -142,7 +153,14 @@ func Error(w http.ResponseWriter, status int, message string) {
 }
 func Decode(r *http.Request, v any) error {
 	defer r.Body.Close()
-	dec := json.NewDecoder(io.LimitReader(r.Body, 2<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, (2<<20)+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > 2<<20 {
+		return errors.New("request body too large")
+	}
+	dec := json.NewDecoder(strings.NewReader(string(body)))
 	dec.DisallowUnknownFields()
 	if e := dec.Decode(v); e != nil {
 		return e

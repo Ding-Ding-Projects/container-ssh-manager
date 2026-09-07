@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -25,15 +26,17 @@ type bucket struct {
 	Until time.Time
 }
 type Auth struct {
-	Store    *core.Store
-	Origin   string
-	Secure   bool
-	mu       sync.Mutex
-	attempts map[string]bucket
+	Store        *core.Store
+	Origin       string
+	Secure       bool
+	mu           sync.Mutex
+	attempts     map[string]bucket
+	TrustedProxy *net.IPNet
+	logins       chan struct{}
 }
 
 func New(s *core.Store, origin string) *Auth {
-	return &Auth{Store: s, Origin: origin, Secure: true, attempts: map[string]bucket{}}
+	return &Auth{Store: s, Origin: origin, Secure: true, attempts: map[string]bucket{}, logins: make(chan struct{}, 4)}
 }
 func Bootstrap(s *core.Store, password []byte) error {
 	h, e := bcrypt.GenerateFromPassword(password, 12)
@@ -48,11 +51,20 @@ func Bootstrap(s *core.Store, password []byte) error {
 	return e
 }
 func key(v string) string { h := sha256.Sum256([]byte(v)); return hex.EncodeToString(h[:]) }
-func (a *Auth) allowed(r *http.Request) bool {
+func (a *Auth) clientIP(r *http.Request) string {
 	ip, _, e := net.SplitHostPort(r.RemoteAddr)
 	if e != nil {
 		ip = r.RemoteAddr
 	}
+	if a.TrustedProxy != nil && a.TrustedProxy.Contains(net.ParseIP(ip)) {
+		if client := net.ParseIP(r.Header.Get("X-Manager-Client-IP")); client != nil {
+			return client.String()
+		}
+	}
+	return ip
+}
+func (a *Auth) allowed(r *http.Request) bool {
+	ip := a.clientIP(r)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
@@ -62,14 +74,35 @@ func (a *Auth) allowed(r *http.Request) bool {
 		}
 	}
 	b := a.attempts[ip]
+	return b.Count < 10
+}
+func (a *Auth) attempt(r *http.Request, success bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ip := a.clientIP(r)
+	if success {
+		delete(a.attempts, ip)
+		return
+	}
+	b := a.attempts[ip]
 	if b.Until.IsZero() {
-		b.Until = now.Add(15 * time.Minute)
+		b.Until = time.Now().Add(15 * time.Minute)
 	}
 	b.Count++
 	a.attempts[ip] = b
-	return b.Count <= 10
+}
+func (a *Auth) prune() error {
+	_, e := a.Store.DB.Exec(`DELETE FROM records WHERE kind='session' AND (json_extract(data,'$.expires') < ? OR id IN (SELECT id FROM records WHERE kind='session' ORDER BY updated_at DESC LIMIT -1 OFFSET 15))`, time.Now().UTC().Format(time.RFC3339Nano))
+	return e
 }
 func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
+	select {
+	case a.logins <- struct{}{}:
+		defer func() { <-a.logins }()
+	default:
+		core.Error(w, 429, "Sign-in busy; try again shortly")
+		return
+	}
 	if !a.allowed(r) {
 		core.Error(w, 429, "Too many attempts; try again later")
 		return
@@ -83,7 +116,13 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	var owner Owner
 	if a.Store.Get("owner", "owner", &owner) != nil || bcrypt.CompareHashAndPassword(owner.Hash, []byte(in.Password)) != nil {
+		a.attempt(r, false)
 		core.Error(w, 401, "Sign-in failed")
+		return
+	}
+	a.attempt(r, true)
+	if a.prune() != nil {
+		core.Error(w, 500, "Session storage unavailable")
 		return
 	}
 	token := core.ID() + core.ID()
@@ -97,7 +136,10 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 }
 func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) {
 	if c, e := r.Cookie("manager_session"); e == nil {
-		_ = a.Store.Delete("session", key(c.Value))
+		if a.Store.Delete("session", key(c.Value)) != nil {
+			core.Error(w, 500, "Session revocation failed; retry logout")
+			return
+		}
 	}
 	http.SetCookie(w, &http.Cookie{Name: "manager_session", Path: "/", MaxAge: -1, Secure: a.Secure, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	core.JSON(w, 200, map[string]bool{"authenticated": false})
@@ -125,7 +167,7 @@ func (a *Auth) Wrap(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if len(r.URL.Path) >= 8 && r.URL.Path[:8] == "/api/v1/" && r.URL.Path != "/api/v1/health" && r.URL.Path != "/api/v1/login" && !a.valid(r) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/v1/health" && r.URL.Path != "/api/v1/version" && r.URL.Path != "/api/v1/login" && !a.valid(r) {
 			core.Error(w, 401, "Sign in required")
 			return
 		}

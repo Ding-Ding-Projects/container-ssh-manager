@@ -1,0 +1,9 @@
+{
+  auto_https disable_redirects
+}
+https://{$MANAGER_HOST}:{$HTTPS_PORT} {
+  tls internal
+  reverse_proxy manager:8080 {
+    header_up X-Manager-Client-IP {remote_host}
+  }
+}

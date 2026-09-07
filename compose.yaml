@@ -1,0 +1,65 @@
+name: container-ssh-manager
+services:
+  manager:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-development}
+        UPDATED_AT: ${UPDATED_AT:-unavailable}
+    image: container-ssh-manager:${VERSION:-development}
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      VAULT_KEY_FILE: /run/secrets/vault.key
+      PUBLIC_ORIGIN: https://${MANAGER_HOST:-localhost}:${HTTPS_PORT:-8443}
+      DOCKER_SOCKET: /var/run/docker.sock
+      TRUSTED_PROXY_CIDR: 172.30.245.3/32
+    volumes:
+      - manager-data:/data
+      - ./secrets/vault.key:/run/secrets/vault.key:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - compose-projects:/projects
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.5
+    networks:
+      control:
+        ipv4_address: 172.30.245.2
+  proxy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    environment:
+      MANAGER_HOST: ${MANAGER_HOST:-localhost}
+      HTTPS_PORT: ${HTTPS_PORT:-8443}
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-8443}:${HTTPS_PORT:-8443}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - tls-data:/data
+      - tls-config:/config
+    depends_on:
+      manager:
+        condition: service_healthy
+    mem_limit: 128m
+    networks:
+      control:
+        ipv4_address: 172.30.245.3
+  init:
+    profiles: [setup]
+    image: container-ssh-manager:${VERSION:-development}
+    environment:
+      VAULT_KEY_FILE: /secrets/vault.key
+    volumes:
+      - ./secrets:/secrets
+    command: [keygen]
+    network_mode: none
+volumes:
+  manager-data:
+  compose-projects:
+  tls-data:
+  tls-config:
+networks:
+  control:
+    ipam:
+      config:
+        - subnet: 172.30.245.0/29
