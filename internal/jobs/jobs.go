@@ -3,6 +3,7 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,11 +16,13 @@ import (
 
 	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/connection"
 	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/core"
+	"github.com/robfig/cron/v3"
 )
 
 const (
 	defaultTimeout = 10 * time.Minute
 	maxRunning     = 4
+	maxAccepted    = 128
 	timezone       = "America/Toronto"
 )
 
@@ -81,6 +84,8 @@ type AuditEvent struct {
 	ID         string    `json:"id"`
 	At         time.Time `json:"at"`
 	Actor      string    `json:"actor"`
+	Source     string    `json:"source,omitempty"`
+	Intent     string    `json:"intent,omitempty"`
 	Action     string    `json:"action"`
 	HostID     string    `json:"hostId,omitempty"`
 	ScheduleID string    `json:"scheduleId,omitempty"`
@@ -88,6 +93,28 @@ type AuditEvent struct {
 	RunID      string    `json:"runId,omitempty"`
 	Result     string    `json:"result,omitempty"`
 	Metadata   any       `json:"metadata,omitempty"`
+}
+
+type outputEnvelope struct {
+	RunID      string `json:"runId"`
+	RevisionID string `json:"revisionId"`
+	MaxBytes   int    `json:"maxBytes"`
+	Output     []byte `json:"output"`
+}
+
+type acceptanceError struct {
+	status  int
+	message string
+}
+
+func (e *acceptanceError) Error() string      { return e.message }
+func reject(status int, message string) error { return &acceptanceError{status, message} }
+
+var errRevisionNotFound = errors.New("revision not found")
+
+type scheduleClaim struct {
+	key        string
+	occurrence occurrence
 }
 
 type RetainedOutput struct {
@@ -104,11 +131,32 @@ type Manager struct {
 	location    *time.Location
 	now         func() time.Time
 
-	mu        sync.Mutex
-	running   map[string]context.CancelFunc
-	sem       chan struct{}
-	run       func(context.Context, string, string) (int, error)
-	runOutput func(context.Context, string, string, int) (int, []byte, error)
+	mu            sync.Mutex
+	outputMu      sync.Mutex
+	ctx           context.Context
+	stop          context.CancelFunc
+	initialized   bool
+	initErr       error
+	startupMinute time.Time
+	active        map[string]*execution
+	hosts         map[string]string
+	queue         []*execution
+	workers       int
+	wg            sync.WaitGroup
+	run           func(context.Context, string, string) (int, error)
+	runOutput     func(context.Context, string, string, int) (int, []byte, error)
+}
+
+type execution struct {
+	run    Run
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+type occurrence struct {
+	Minute        time.Time `json:"minute"`
+	WallMinute    string    `json:"wallMinute"`
+	Configuration string    `json:"configuration"`
 }
 
 func New(store *core.Store, connections *connection.Manager, vault *core.Vault) *Manager {
@@ -116,7 +164,8 @@ func New(store *core.Store, connections *connection.Manager, vault *core.Vault) 
 	if err != nil {
 		loc = time.FixedZone(timezone, -5*60*60)
 	}
-	m := &Manager{store: store, connections: connections, vault: vault, location: loc, now: time.Now, running: make(map[string]context.CancelFunc), sem: make(chan struct{}, maxRunning)}
+	ctx, stop := context.WithCancel(context.Background())
+	m := &Manager{store: store, connections: connections, vault: vault, location: loc, now: time.Now, ctx: ctx, stop: stop, active: make(map[string]*execution), hosts: make(map[string]string)}
 	m.run = func(ctx context.Context, hostID, command string) (int, error) {
 		return connections.Run(ctx, hostID, command)
 	}
@@ -141,27 +190,81 @@ func (m *Manager) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/jobs/runs", m.listRuns)
 	mux.HandleFunc("POST /api/v1/jobs/runs", m.createRun)
 	mux.HandleFunc("GET /api/v1/jobs/runs/{id}", m.getRun)
+	mux.HandleFunc("GET /api/v1/jobs/runs/{id}/output", m.getOutput)
 	mux.HandleFunc("POST /api/v1/jobs/runs/{id}/cancel", m.cancelRun)
 	mux.HandleFunc("GET /api/v1/jobs/audit", m.listAudit)
 }
 
-// Start recovers incomplete runs and checks schedules once per minute. It deliberately never
-// backfills a missed tick, which prevents restart from replaying an unknown command.
+// Start observes future minute boundaries only. Recovery runs once before any acceptance,
+// including an HTTP request arriving before the scheduler goroutine starts.
 func (m *Manager) Start(ctx context.Context) {
-	m.recoverUnknown()
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
+	m.mu.Lock()
+	m.initializeLocked()
+	err := m.initErr
+	m.mu.Unlock()
+	if err != nil {
+		return
+	}
+	defer m.Close()
 	for {
-		m.runDue(ctx, m.now().In(m.location).Truncate(time.Minute))
+		now := m.now()
+		timer := time.NewTimer(now.Truncate(time.Minute).Add(time.Minute).Sub(now))
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-m.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			m.runDue(m.ctx, m.now().UTC().Truncate(time.Minute))
 		}
 	}
 }
 
-func (m *Manager) runDue(ctx context.Context, now time.Time) {
+// Close stops accepting commands. Queued commands have never contacted a host;
+// active SSH commands remain termination_unknown unless termination is proven.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stop()
+	for _, e := range m.active {
+		e.cancel()
+		if e.run.Status == "queued" {
+			e.run.Status = "cancelled"
+			now := m.now().UTC()
+			e.run.FinishedAt = &now
+			e.run.Error = "server stopped before execution"
+			if err := m.persistRunEvent(e.run, "system", "run_stopped_before_execution", e.run.Status); err != nil {
+				m.initErr = err
+				continue
+			}
+			delete(m.active, e.run.ID)
+			delete(m.hosts, e.run.HostID)
+		}
+	}
+	m.queue = nil
+}
+
+func (m *Manager) initializeLocked() {
+	if m.initialized {
+		return
+	}
+	m.initialized = true
+	m.startupMinute = m.now().UTC().Truncate(time.Minute)
+	m.initErr = m.recoverUnknown()
+}
+
+func (m *Manager) runDue(_ context.Context, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.initializeLocked()
+	now = now.UTC().Truncate(time.Minute)
+	// A late wake checks only its current minute, never a backlog or the minute
+	// in which this manager started. UTC ordering also tolerates clock rollback.
+	if m.initErr != nil || m.ctx.Err() != nil || !now.After(m.startupMinute) || !now.Equal(m.now().UTC().Truncate(time.Minute)) {
+		return
+	}
 	schedules, err := m.schedules()
 	if err != nil {
 		return
@@ -178,134 +281,279 @@ func (m *Manager) runDue(ctx context.Context, now time.Time) {
 		if err != nil || !spec.Match(now.In(loc)) {
 			continue
 		}
-		for _, hostID := range scheduleHosts(schedule) {
-			if m.hostRunning(hostID) {
-				m.audit("system", "schedule_skipped_overlap", hostID, schedule.ID, schedule.RevisionID, "skipped", nil)
+		for _, host := range scheduleHosts(schedule) {
+			// One stable row per schedule/host carries the configuration identity.
+			// Local wall time deliberately skips the repeated DST fall-back hour.
+			key := schedule.ID + ":" + host
+			configuration := schedule.Timezone + ":" + schedule.Cron + ":" + schedule.UpdatedAt.UTC().Format(time.RFC3339Nano)
+			wall := now.In(loc).Format("2006-01-02T15:04")
+			var last occurrence
+			err := m.store.Get("job_occurrence", key, &last)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
-			if revision, err := m.revision(schedule.RevisionID); err == nil {
-				_, _ = m.submit(ctx, Run{HostID: hostID, ScheduleID: schedule.ID, RevisionID: revision.ID, Source: "schedule", Intent: "AUTOAPPROVED", TimeoutSeconds: int(defaultTimeout.Seconds())})
+			if err == nil && last.Configuration == configuration && (!now.After(last.Minute) || wall <= last.WallMinute) {
+				continue
+			}
+			claim := scheduleClaim{key: key, occurrence: occurrence{Minute: now, WallMinute: wall, Configuration: configuration}}
+			_, err = m.acceptLocked([]string{host}, schedule.RevisionID, int(defaultTimeout.Seconds()), schedule.ID, claim)
+			if err != nil {
+				event := AuditEvent{ID: core.ID(), At: m.now().UTC(), Actor: "system", Source: "schedule", Intent: "AUTOAPPROVED", Action: "schedule_skipped", HostID: host, ScheduleID: schedule.ID, RevisionID: schedule.RevisionID, Result: "skipped"}
+				if err := m.persistSkip(claim, event); err != nil {
+					m.initErr = err
+					return
+				}
 			}
 		}
 	}
+	m.dispatchLocked()
 }
 
-func (m *Manager) submit(parent context.Context, run Run) (Run, error) {
-	if strings.TrimSpace(run.HostID) == "" || strings.TrimSpace(run.RevisionID) == "" {
-		return Run{}, errors.New("hostId and revisionId are required")
-	}
-	if run.TimeoutSeconds == 0 {
-		run.TimeoutSeconds = int(defaultTimeout.Seconds())
-	}
-	if run.TimeoutSeconds < 1 || run.TimeoutSeconds > int(defaultTimeout.Seconds()) {
-		return Run{}, errors.New("timeoutSeconds must be between 1 and 600")
-	}
-	revision, err := m.revision(run.RevisionID)
-	if err != nil {
-		return Run{}, errors.New("revision not found")
-	}
-	run.CommandRevision = revision
-	if m.hostRunning(run.HostID) {
-		return Run{}, errors.New("a job is already running on this host")
-	}
-	run.ID, run.Status, run.StartedAt = core.ID(), "queued", m.now().UTC()
-	if run.Source == "" {
-		run.Source = "manual"
-	}
-	if run.Intent == "" {
-		run.Intent = "USER_APPROVED"
-	}
-	if err := m.store.Put("job_run", run.ID, run); err != nil {
-		return Run{}, err
-	} // durable intent before execution
-	m.audit("session", "run_intent_saved", run.HostID, run.ScheduleID, run.RevisionID, "queued", map[string]any{"runId": run.ID, "intent": run.Intent})
-	go m.execute(parent, run)
-	return run, nil
-}
-
-func (m *Manager) execute(parent context.Context, run Run) {
-	select {
-	case m.sem <- struct{}{}:
-		defer func() { <-m.sem }()
-	default:
-		run.Status = "skipped_capacity"
-		now := m.now().UTC()
-		run.FinishedAt = &now
-		_ = m.store.Put("job_run", run.ID, run)
-		m.audit("system", "run_skipped_capacity", run.HostID, run.ScheduleID, run.RevisionID, run.Status, map[string]any{"runId": run.ID})
-		return
-	}
-	if m.hostRunning(run.HostID) {
-		run.Status = "skipped_overlap"
-		now := m.now().UTC()
-		run.FinishedAt = &now
-		_ = m.store.Put("job_run", run.ID, run)
-		return
-	}
-	ctx, cancel := context.WithTimeout(parent, time.Duration(run.TimeoutSeconds)*time.Second)
+// submit is also used by scheduler tests; request cancellation must never own a
+// durable accepted command. Only manager shutdown and explicit cancellation do.
+func (m *Manager) submit(_ context.Context, run Run) (Run, error) {
 	m.mu.Lock()
-	m.running[run.ID] = cancel
+	defer m.mu.Unlock()
+	m.initializeLocked()
+	runs, err := m.acceptLocked([]string{run.HostID}, run.RevisionID, run.TimeoutSeconds, run.ScheduleID)
+	if err != nil {
+		return Run{}, err
+	}
+	m.dispatchLocked()
+	return runs[0], nil
+}
+
+// acceptLocked persists the entire multi-host batch and its audit events in one
+// transaction before publishing reservations or allowing any connection to open.
+func (m *Manager) acceptLocked(hosts []string, revisionID string, timeout int, scheduleID string, claims ...scheduleClaim) ([]Run, error) {
+	if m.initErr != nil {
+		return nil, reject(503, "job persistence unavailable; restart required")
+	}
+	if m.ctx.Err() != nil {
+		return nil, reject(503, "job manager is stopped")
+	}
+	if timeout == 0 {
+		timeout = int(defaultTimeout.Seconds())
+	}
+	if timeout < 1 || timeout > int(defaultTimeout.Seconds()) {
+		return nil, reject(400, "timeoutSeconds must be between 1 and 600")
+	}
+	hosts = uniqueHosts(hosts)
+	if len(hosts) == 0 || strings.TrimSpace(revisionID) == "" {
+		return nil, reject(400, "hostIds and revisionId are required")
+	}
+	if len(m.active)+len(hosts) > maxAccepted {
+		return nil, reject(409, "job queue is full (128 accepted commands)")
+	}
+	for _, host := range hosts {
+		if m.hosts[host] != "" {
+			return nil, reject(409, fmt.Sprintf("host %s already has an accepted job; no commands accepted", host))
+		}
+	}
+	revision, err := m.revision(revisionID)
+	if err != nil {
+		if errors.Is(err, errRevisionNotFound) {
+			return nil, reject(404, "revision not found")
+		}
+		return nil, reject(503, "revision storage unavailable")
+	}
+	if err = validRetention(revision.Retention); err != nil {
+		return nil, reject(503, "stored output retention is invalid")
+	}
+	if revision.Retention.Enabled && m.vault == nil {
+		return nil, reject(503, "output retention vault unavailable")
+	}
+	runs := make([]Run, 0, len(hosts))
+	tx, err := m.store.DB.Begin()
+	if err != nil {
+		return nil, reject(503, "cannot persist command intent")
+	}
+	defer tx.Rollback()
+	for _, claim := range claims {
+		if err := upsertTransaction(tx, "job_occurrence", claim.key, claim.occurrence); err != nil {
+			return nil, reject(503, "cannot persist schedule occurrence")
+		}
+	}
+	for _, host := range hosts {
+		run := Run{ID: core.ID(), HostID: host, RevisionID: revisionID, CommandRevision: revision, ScheduleID: scheduleID, TimeoutSeconds: timeout, Status: "queued", StartedAt: m.now().UTC(), Source: "manual", Intent: "USER_APPROVED"}
+		actor := "session"
+		if scheduleID != "" {
+			run.Source, run.Intent, actor = "schedule", "AUTOAPPROVED", "system"
+		}
+		if err = putTransaction(tx, "job_run", run.ID, run); err != nil {
+			return nil, reject(503, "cannot persist command intent")
+		}
+		event := AuditEvent{ID: core.ID(), At: m.now().UTC(), Actor: actor, Source: run.Source, Intent: run.Intent, Action: "run_intent_saved", HostID: host, ScheduleID: scheduleID, RevisionID: revisionID, RunID: run.ID, Result: "queued"}
+		if err = putTransaction(tx, "job_audit", event.ID, event); err != nil {
+			return nil, reject(503, "cannot persist command audit")
+		}
+		runs = append(runs, run)
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, reject(503, "cannot persist command intent")
+	}
+	for _, run := range runs {
+		ctx, cancel := context.WithCancel(m.ctx)
+		e := &execution{run: run, ctx: ctx, cancel: cancel}
+		m.active[run.ID] = e
+		m.hosts[run.HostID] = run.ID
+		m.queue = append(m.queue, e)
+	}
+	return runs, nil
+}
+
+func putTransaction(tx *sql.Tx, kind, id string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO records(kind,id,data,updated_at) VALUES(?,?,?,?)`, kind, id, string(data), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func upsertTransaction(tx *sql.Tx, kind, id string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO records(kind,id,data,updated_at) VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at`, kind, id, string(data), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func pruneAuditTransaction(tx *sql.Tx, cutoff time.Time) error {
+	_, err := tx.Exec(`DELETE FROM records WHERE kind='job_audit' AND json_extract(data,'$.at') < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (m *Manager) persistRunEvent(run Run, actor, action, result string) error {
+	tx, err := m.store.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	event := AuditEvent{ID: core.ID(), At: m.now().UTC(), Actor: actor, Source: run.Source, Intent: run.Intent, Action: action, HostID: run.HostID, ScheduleID: run.ScheduleID, RevisionID: run.RevisionID, RunID: run.ID, Result: result, Metadata: map[string]any{"cancelRequested": run.CancelRequested}}
+	if err := upsertTransaction(tx, "job_run", run.ID, run); err != nil {
+		return err
+	}
+	if err := putTransaction(tx, "job_audit", event.ID, event); err != nil {
+		return err
+	}
+	if err := pruneAuditTransaction(tx, m.now().Add(-90*24*time.Hour)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (m *Manager) persistSkip(claim scheduleClaim, event AuditEvent) error {
+	tx, err := m.store.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertTransaction(tx, "job_occurrence", claim.key, claim.occurrence); err != nil {
+		return err
+	}
+	if err := putTransaction(tx, "job_audit", event.ID, event); err != nil {
+		return err
+	}
+	if err := pruneAuditTransaction(tx, m.now().Add(-90*24*time.Hour)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (m *Manager) dispatchLocked() {
+	if m.ctx.Err() != nil || m.initErr != nil {
+		return
+	}
+	for m.workers < maxRunning && len(m.queue) > 0 {
+		e := m.queue[0]
+		if _, exists := m.active[e.run.ID]; !exists {
+			m.queue = m.queue[1:]
+			continue
+		}
+		e.run.Status = "running"
+		if err := m.store.Put("job_run", e.run.ID, e.run); err != nil {
+			e.run.Status = "queued"
+			return
+		}
+		m.queue = m.queue[1:]
+		m.workers++
+		m.wg.Add(1)
+		go m.execute(e)
+	}
+}
+
+func (m *Manager) execute(e *execution) {
+	defer m.wg.Done()
+	// Snapshot is immutable after acceptance. No lookup of a mutable snippet is
+	// permitted on this path, including after deletion or another revision edit.
+	m.mu.Lock()
+	run := e.run
 	m.mu.Unlock()
-	defer func() { cancel(); m.mu.Lock(); delete(m.running, run.ID); m.mu.Unlock() }()
-	run.Status = "running"
-	_ = m.store.Put("job_run", run.ID, run)
-	_, err := m.revision(run.RevisionID)
-	if err == nil {
-		var code int
+	ctx, cancel := context.WithTimeout(e.ctx, time.Duration(run.TimeoutSeconds)*time.Second)
+	defer cancel()
+	var err error
+	var code int
+	launched := ctx.Err() == nil
+	if launched {
 		if run.CommandRevision.Retention.Enabled {
 			var output []byte
 			code, output, err = m.runOutput(ctx, run.HostID, run.CommandRevision.Command, run.CommandRevision.Retention.MaxBytes)
 			if err == nil {
 				err = m.saveOutput(run.ID, run.RevisionID, output, run.CommandRevision.Retention)
 			}
+			clear(output)
 		} else {
 			code, err = m.run(ctx, run.HostID, run.CommandRevision.Command)
 		}
-		run.ExitCode = &code
 	}
-	now := m.now().UTC()
-	run.FinishedAt = &now
-	// Cancellation is persisted by the handler while this goroutine may be
-	// blocked in the runner. Reload it so the final outcome never claims a
-	// confirmed termination based on a stale in-memory copy.
-	var latest Run
-	if m.store.Get("job_run", run.ID, &latest) == nil && latest.CancelRequested {
-		run.CancelRequested = true
-	}
-	if run.CancelRequested {
-		run.Status = "termination_unknown"
-		run.Error = "cancellation requested; remote process termination could not be confirmed"
-	} else if errors.Is(err, context.DeadlineExceeded) {
-		run.Status = "timed_out"
-		run.Error = "timeout reached"
-	} else if err != nil {
-		run.Status = "failed"
-		run.Error = err.Error()
-	} else if run.ExitCode != nil && *run.ExitCode != 0 {
-		run.Status = "failed"
-	} else {
-		run.Status = "succeeded"
-	}
-	_ = m.store.Put("job_run", run.ID, run)
-	m.audit("system", "run_finished", run.HostID, run.ScheduleID, run.RevisionID, run.Status, map[string]any{"runId": run.ID})
-}
-
-func (m *Manager) hostRunning(host string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for id := range m.running {
-		var run Run
-		if m.store.Get("job_run", id, &run) == nil && run.HostID == host {
-			return true
+	run.CancelRequested = e.run.CancelRequested
+	now := m.now().UTC()
+	run.FinishedAt = &now
+	if !launched {
+		run.Status = "cancelled"
+		run.Error = "cancelled before execution"
+	} else if run.CancelRequested || errors.Is(ctx.Err(), context.Canceled) {
+		run.Status = "termination_unknown"
+		run.Error = "cancellation requested; remote process termination could not be confirmed"
+	} else if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		run.Status = "termination_unknown"
+		run.Error = "timeout reached; remote process termination could not be confirmed"
+	} else if err != nil {
+		run.Status = "failed"
+		// Transport errors can echo commands or remote output. Never persist them.
+		run.Error = "command execution or output retention failed"
+	} else {
+		run.ExitCode = &code
+		run.Status = "succeeded"
+		if code != 0 {
+			run.Status = "failed"
 		}
 	}
-	return false
+	if err := m.persistRunEvent(run, "system", "run_finished", run.Status); err != nil {
+		m.initErr = err
+		// Keep the reservation when the final result cannot be made durable.
+		// A restart will recover this persisted running row as unknown.
+		e.run = run
+		e.cancel()
+		m.workers--
+		return
+	}
+	e.run = run
+	delete(m.active, run.ID)
+	delete(m.hosts, run.HostID)
+	e.cancel()
+	m.workers--
+	m.dispatchLocked()
 }
 
-func (m *Manager) recoverUnknown() {
+func (m *Manager) recoverUnknown() error {
 	runs, err := m.runs()
 	if err != nil {
-		return
+		return err
 	}
 	for _, run := range runs {
 		if run.Status == "queued" || run.Status == "running" {
@@ -313,10 +561,12 @@ func (m *Manager) recoverUnknown() {
 			now := m.now().UTC()
 			run.FinishedAt = &now
 			run.Error = "server restarted; run was not replayed"
-			_ = m.store.Put("job_run", run.ID, run)
-			m.audit("system", "run_recovered_unknown", run.HostID, run.ScheduleID, run.RevisionID, run.Status, map[string]any{"runId": run.ID})
+			if err := m.persistRunEvent(run, "system", "run_recovered_unknown", run.Status); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 func (m *Manager) snippets() ([]Snippet, error) {
@@ -375,10 +625,19 @@ func (m *Manager) revision(id string) (Revision, error) {
 			}
 		}
 	}
-	return Revision{}, errors.New("revision not found")
+	return Revision{}, errRevisionNotFound
 }
 func (m *Manager) audit(actor, action, host, schedule, revision, result string, metadata any) {
 	event := AuditEvent{ID: core.ID(), At: m.now().UTC(), Actor: actor, Action: action, HostID: host, ScheduleID: schedule, RevisionID: revision, Result: result, Metadata: metadata}
+	if fields, ok := metadata.(map[string]any); ok {
+		event.RunID, _ = fields["runId"].(string)
+	}
+	if event.RunID != "" || strings.HasPrefix(action, "schedule_skipped") {
+		event.Source, event.Intent = "manual", "USER_APPROVED"
+		if schedule != "" {
+			event.Source, event.Intent = "schedule", "AUTOAPPROVED"
+		}
+	}
 	_ = m.store.Put("job_audit", event.ID, event)
 	// Audit metadata is intentionally retained for 90 days, then deleted rather
 	// than merely hidden by the list endpoint.
@@ -426,17 +685,24 @@ func validRetention(v Retention) error {
 }
 
 func (m *Manager) saveOutput(runID, revisionID string, plaintext []byte, retention Retention) error {
+	m.outputMu.Lock()
+	defer m.outputMu.Unlock()
+	if err := validRetention(retention); err != nil || !retention.Enabled {
+		return errors.New("invalid output retention")
+	}
 	if len(plaintext) > retention.MaxBytes {
 		return errors.New("command output exceeds retention limit")
 	}
 	if m.vault == nil {
 		return errors.New("output retention vault unavailable")
 	}
-	ciphertext, err := m.vault.Seal(plaintext)
+	envelope, err := json.Marshal(outputEnvelope{RunID: runID, RevisionID: revisionID, MaxBytes: retention.MaxBytes, Output: plaintext})
 	if err != nil {
 		return err
 	}
-	if err = m.store.Put("job_output", runID, RetainedOutput{RunID: runID, Ciphertext: ciphertext, MaxBytes: retention.MaxBytes, CreatedAt: m.now().UTC()}); err != nil {
+	defer clear(envelope)
+	ciphertext, err := m.vault.Seal(envelope)
+	if err != nil {
 		return err
 	}
 	runs, err := m.runs()
@@ -446,16 +712,33 @@ func (m *Manager) saveOutput(runID, revisionID string, plaintext []byte, retenti
 	retained := make([]Run, 0, retention.MaxRuns)
 	for _, run := range runs {
 		if run.RevisionID == revisionID {
-			var record RetainedOutput
-			if m.store.Get("job_output", run.ID, &record) == nil {
+			if run.ID == runID {
 				retained = append(retained, run)
+				continue
+			}
+			var record RetainedOutput
+			err := m.store.Get("job_output", run.ID, &record)
+			if err == nil {
+				retained = append(retained, run)
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return err
 			}
 		}
 	}
-	for index := retention.MaxRuns; index < len(retained); index++ {
-		_ = m.store.Delete("job_output", retained[index].ID)
+	tx, err := m.store.DB.Begin()
+	if err != nil {
+		return err
 	}
-	return nil
+	defer tx.Rollback()
+	if err := putTransaction(tx, "job_output", runID, RetainedOutput{RunID: runID, Ciphertext: ciphertext, MaxBytes: retention.MaxBytes, CreatedAt: m.now().UTC()}); err != nil {
+		return err
+	}
+	for index := retention.MaxRuns; index < len(retained); index++ {
+		if _, err := tx.Exec(`DELETE FROM records WHERE kind='job_output' AND id=?`, retained[index].ID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 func (m *Manager) createSnippet(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -601,6 +884,8 @@ func (m *Manager) updateSchedule(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, e.Error())
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	id := r.PathValue("id")
 	var old Schedule
 	if e = m.store.Get("job_schedule", id, &old); e != nil {
@@ -610,7 +895,7 @@ func (m *Manager) updateSchedule(w http.ResponseWriter, r *http.Request) {
 	s.ID = id
 	s.CreatedAt = old.CreatedAt
 	s.UpdatedAt = m.now().UTC()
-	if e = m.store.Put("job_schedule", id, s); e != nil {
+	if e = m.changeSchedule(s, false); e != nil {
 		fail(w, 500, e.Error())
 		return
 	}
@@ -618,13 +903,42 @@ func (m *Manager) updateSchedule(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, s)
 }
 func (m *Manager) deleteSchedule(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	id := r.PathValue("id")
-	if e := m.store.Delete("job_schedule", id); e != nil {
+	var schedule Schedule
+	if e := m.store.Get("job_schedule", id, &schedule); e != nil {
 		fail(w, 404, "schedule not found")
+		return
+	}
+	if e := m.changeSchedule(schedule, true); e != nil {
+		fail(w, 503, "schedule storage unavailable")
 		return
 	}
 	m.audit("session", "schedule_deleted", "", id, "", "deleted", nil)
 	w.WriteHeader(204)
+}
+
+// Replace/delete the schedule and retire all its prior host/configuration claims
+// atomically. The scheduler mutex prevents a tick from restoring an obsolete row.
+func (m *Manager) changeSchedule(schedule Schedule, remove bool) error {
+	tx, err := m.store.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if remove {
+		if _, err := tx.Exec(`DELETE FROM records WHERE kind='job_schedule' AND id=?`, schedule.ID); err != nil {
+			return err
+		}
+	} else if err := upsertTransaction(tx, "job_schedule", schedule.ID, schedule); err != nil {
+		return err
+	}
+	prefix := schedule.ID + ":"
+	if _, err := tx.Exec(`DELETE FROM records WHERE kind='job_occurrence' AND substr(id,1,length(?))=?`, prefix, prefix); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (m *Manager) previewSchedule(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -661,12 +975,18 @@ func (m *Manager) previewSchedule(w http.ResponseWriter, r *http.Request) {
 		in.After = m.now()
 	}
 	times := make([]time.Time, 0, in.Count)
-	cursor := in.After.In(loc).Truncate(time.Minute)
+	cursor := in.After.In(loc)
 	for len(times) < in.Count {
-		cursor = cursor.Add(time.Minute)
-		if spec.Match(cursor) {
-			times = append(times, cursor)
+		if r.Context().Err() != nil {
+			fail(w, 408, "preview cancelled")
+			return
 		}
+		cursor = spec.Next(cursor)
+		if cursor.IsZero() {
+			fail(w, 400, "cron has no occurrence within the five-year search horizon")
+			return
+		}
+		times = append(times, cursor)
 	}
 	write(w, 200, map[string]any{"timezone": in.Timezone, "times": times})
 }
@@ -694,9 +1014,18 @@ func (m *Manager) getRun(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, v)
 }
+
+// Run requests intentionally omit server-owned audit and execution fields.
+type runRequest struct {
+	HostID         string   `json:"hostId"`
+	HostIDs        []string `json:"hostIds"`
+	RevisionID     string   `json:"revisionId"`
+	TimeoutSeconds int      `json:"timeoutSeconds"`
+}
+
 func (m *Manager) createRun(w http.ResponseWriter, r *http.Request) {
-	var in Run
-	if e := decode(r, &in); e != nil {
+	var in runRequest
+	if err := decode(r, &in); err != nil {
 		fail(w, 400, "invalid JSON")
 		return
 	}
@@ -708,19 +1037,71 @@ func (m *Manager) createRun(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "hostIds are required")
 		return
 	}
-	runs := make([]Run, 0, len(hosts))
-	for _, hostID := range hosts {
-		candidate := in
-		candidate.HostID = hostID
-		candidate.HostIDs = nil
-		run, e := m.submit(r.Context(), candidate)
-		if e != nil {
-			fail(w, 409, e.Error())
-			return
+	m.mu.Lock()
+	m.initializeLocked()
+	runs, err := m.acceptLocked(hosts, in.RevisionID, in.TimeoutSeconds, "")
+	if err == nil {
+		m.dispatchLocked()
+	}
+	m.mu.Unlock()
+	if err != nil {
+		status := 500
+		var rejected *acceptanceError
+		if errors.As(err, &rejected) {
+			status = rejected.status
 		}
-		runs = append(runs, run)
+		fail(w, status, err.Error())
+		return
 	}
 	write(w, 202, map[string]any{"runs": runs})
+}
+
+// Register is mounted inside the same authenticated, same-origin boundary as all
+// other jobs routes. Plaintext is available only through this deliberate read.
+func (m *Manager) getOutput(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	var run Run
+	if m.store.Get("job_run", r.PathValue("id"), &run) != nil {
+		fail(w, 404, "run not found")
+		return
+	}
+	if !run.CommandRevision.Retention.Enabled {
+		fail(w, 404, "output was not retained")
+		return
+	}
+	m.outputMu.Lock()
+	defer m.outputMu.Unlock()
+	var record RetainedOutput
+	if m.store.Get("job_output", run.ID, &record) != nil {
+		fail(w, 404, "output was not retained or has expired")
+		return
+	}
+	if m.vault == nil {
+		fail(w, 503, "output vault unavailable")
+		return
+	}
+	if record.RunID != run.ID || record.MaxBytes != run.CommandRevision.Retention.MaxBytes || record.MaxBytes < 1 || record.MaxBytes > 1<<20 || len(record.Ciphertext) > record.MaxBytes*2+512 {
+		fail(w, 500, "invalid retained output")
+		return
+	}
+	plaintext, err := m.vault.Open(record.Ciphertext)
+	if err != nil {
+		fail(w, 500, "retained output unavailable")
+		return
+	}
+	defer clear(plaintext)
+	var envelope outputEnvelope
+	if err := json.Unmarshal(plaintext, &envelope); err != nil {
+		fail(w, 500, "invalid retained output")
+		return
+	}
+	defer clear(envelope.Output)
+	if envelope.RunID != run.ID || envelope.RevisionID != run.RevisionID || envelope.MaxBytes != record.MaxBytes || len(envelope.Output) > record.MaxBytes {
+		fail(w, 500, "invalid retained output identity or bound")
+		return
+	}
+	write(w, 200, map[string]any{"runId": run.ID, "output": string(envelope.Output)})
 }
 
 func uniqueHosts(hosts []string) []string {
@@ -752,24 +1133,48 @@ func scheduleLocation(name string) (*time.Location, error) {
 	return loc, nil
 }
 func (m *Manager) cancelRun(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var run Run
-	if e := m.store.Get("job_run", r.PathValue("id"), &run); e != nil {
+	if err := m.store.Get("job_run", r.PathValue("id"), &run); err != nil {
 		fail(w, 404, "run not found")
 		return
 	}
-	m.mu.Lock()
-	cancel, ok := m.running[run.ID]
-	m.mu.Unlock()
-	if !ok {
+	e, ok := m.active[run.ID]
+	if !ok || (e.run.Status != "queued" && e.run.Status != "running") {
 		fail(w, 409, "run is not active")
 		return
 	}
+	run = e.run
 	run.CancelRequested = true
-	_ = m.store.Put("job_run", run.ID, run)
-	cancel()
-	m.audit("session", "run_cancel_requested", run.HostID, run.ScheduleID, run.RevisionID, "termination_unknown", map[string]any{"runId": run.ID})
-	write(w, 202, map[string]string{"status": "termination_unknown"})
+	result := "termination_unknown"
+	if run.Status == "queued" {
+		// This reservation never reached a worker, so cancellation is proven.
+		run.Status, result = "cancelled", "cancelled"
+		now := m.now().UTC()
+		run.FinishedAt = &now
+	}
+	if err := m.persistRunEvent(run, "session", "run_cancel_requested", result); err != nil {
+		fail(w, 500, "cannot persist cancellation")
+		return
+	}
+	e.run = run
+	e.cancel()
+	if result == "cancelled" {
+		delete(m.active, run.ID)
+		delete(m.hosts, run.HostID)
+		// Physically remove cancelled queue entries so repeated submit/cancel
+		// requests cannot grow the in-memory queue beyond its durable bound.
+		for i, candidate := range m.queue {
+			if candidate == e {
+				m.queue = append(m.queue[:i], m.queue[i+1:]...)
+				break
+			}
+		}
+	}
+	write(w, 202, map[string]string{"status": result})
 }
+
 func (m *Manager) listAudit(w http.ResponseWriter, r *http.Request) {
 	raws, e := m.store.List("job_audit")
 	if e != nil {
@@ -796,72 +1201,18 @@ func (m *Manager) listAudit(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, out)
 }
 
-type cronSpec struct{ fields [5]map[int]bool }
+// The pinned cron parser handles standard day-of-month/day-of-week semantics,
+// single-value steps, and a bounded Next search for impossible dates.
+type cronSpec struct{ cron.Schedule }
 
 func parseCron(text string) (cronSpec, error) {
-	parts := strings.Fields(text)
-	if len(parts) != 5 {
-		return cronSpec{}, errors.New("cron must have five fields")
+	schedule, err := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow).Parse(text)
+	if err != nil {
+		return cronSpec{}, errors.New("invalid five-field cron expression")
 	}
-	bounds := [5][2]int{{0, 59}, {0, 23}, {1, 31}, {1, 12}, {0, 6}}
-	var spec cronSpec
-	for i, part := range parts {
-		values, e := cronField(part, bounds[i][0], bounds[i][1])
-		if e != nil {
-			return cronSpec{}, fmt.Errorf("cron field %d: %w", i+1, e)
-		}
-		spec.fields[i] = values
-	}
-	return spec, nil
-}
-func cronField(text string, min, max int) (map[int]bool, error) {
-	out := map[int]bool{}
-	for _, segment := range strings.Split(text, ",") {
-		base, stepText, hasStep := strings.Cut(segment, "/")
-		step := 1
-		if hasStep {
-			value, e := strconv.Atoi(stepText)
-			if e != nil || value < 1 {
-				return nil, errors.New("invalid step")
-			}
-			step = value
-		}
-		start, end := min, max
-		if base != "*" {
-			if strings.Contains(base, "-") {
-				parts := strings.Split(base, "-")
-				if len(parts) != 2 {
-					return nil, errors.New("invalid range")
-				}
-				a, e := strconv.Atoi(parts[0])
-				if e != nil {
-					return nil, errors.New("invalid range")
-				}
-				b, e := strconv.Atoi(parts[1])
-				if e != nil {
-					return nil, errors.New("invalid range")
-				}
-				start, end = a, b
-			} else {
-				value, e := strconv.Atoi(base)
-				if e != nil {
-					return nil, errors.New("invalid value")
-				}
-				start, end = value, value
-			}
-		}
-		if start < min || end > max || start > end {
-			return nil, errors.New("value out of range")
-		}
-		for value := start; value <= end; value += step {
-			out[value] = true
-		}
-	}
-	if len(out) == 0 {
-		return nil, errors.New("empty field")
-	}
-	return out, nil
+	return cronSpec{schedule}, nil
 }
 func (c cronSpec) Match(t time.Time) bool {
-	return c.fields[0][t.Minute()] && c.fields[1][t.Hour()] && c.fields[2][t.Day()] && c.fields[3][int(t.Month())] && c.fields[4][int(t.Weekday())]
+	t = t.Truncate(time.Minute)
+	return c.Next(t.Add(-time.Minute)).Equal(t)
 }
