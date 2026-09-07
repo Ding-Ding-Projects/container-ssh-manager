@@ -96,13 +96,21 @@ func (m *Manager) PutHost(h Host) error {
 	}
 	return m.store.Put(hostKind, h.ID, h)
 }
-func (m *Manager) Host(id string) (Host, error) { var h Host; return h, m.store.Get(hostKind, id, &h) }
+func (m *Manager) Host(id string) (Host, error) {
+	if id == "local" {
+		return Host{ID: "local", Name: "Local engine", Address: "local", Group: "local"}, nil
+	}
+	var h Host
+	err := m.store.Get(hostKind, id, &h)
+	return h, err
+}
 func (m *Manager) Hosts() ([]Host, error) {
 	raw, e := m.store.List(hostKind)
 	if e != nil {
 		return nil, e
 	}
-	out := make([]Host, 0, len(raw))
+	out := make([]Host, 1, len(raw)+1)
+	out[0] = Host{ID: "local", Name: "Local engine", Address: "local", Group: "local"}
 	for _, v := range raw {
 		var h Host
 		if e = json.Unmarshal(v, &h); e != nil {

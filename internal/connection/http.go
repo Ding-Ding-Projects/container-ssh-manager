@@ -36,6 +36,7 @@ func (m *Manager) hostsHandler(w http.ResponseWriter, r *http.Request) {
 		var h Host
 		e := core.Decode(r, &h)
 		if e == nil {
+			h.ID = core.ID()
 			e = m.PutHost(h)
 		}
 		if e != nil {
