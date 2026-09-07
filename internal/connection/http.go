@@ -1,7 +1,7 @@
 package connection
 
 import (
-	"context"
+	"database/sql"
 	"errors"
 	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/core"
 	"github.com/gorilla/websocket"
@@ -36,6 +36,7 @@ func (m *Manager) hostsHandler(w http.ResponseWriter, r *http.Request) {
 		var h Host
 		e := core.Decode(r, &h)
 		if e == nil {
+			h.ID = core.ID()
 			e = m.PutHost(h)
 		}
 		if e != nil {
@@ -126,7 +127,7 @@ func (m *Manager) hostHandler(w http.ResponseWriter, r *http.Request) {
 		core.JSON(w, 200, map[string]int{"exitCode": code})
 	case "terminal":
 		m.terminalHandler(w, r, id)
-	case "files", "files/content", "files/download":
+	case "files", "files/content", "files/download", "files/upload":
 		m.filesHandler(w, r, id)
 	default:
 		core.Error(w, 404, "not found")
@@ -159,13 +160,38 @@ func (m *Manager) credentialHandler(w http.ResponseWriter, r *http.Request) {
 		core.Error(w, 404, "not found")
 		return
 	}
-	if !method(w, r, "DELETE") {
-		return
+	switch r.Method {
+	case "PUT":
+		var q struct {
+			Name   string  `json:"name"`
+			Secret *string `json:"secret"`
+		}
+		if e := core.Decode(r, &q); e != nil {
+			core.Error(w, 400, e.Error())
+			return
+		}
+		var secret *[]byte
+		if q.Secret != nil {
+			b := []byte(*q.Secret)
+			defer clear(b)
+			secret = &b
+		}
+		v, e := m.UpdateCredential(id, q.Name, secret)
+		respond(w, e, v)
+	case "DELETE":
+		respond(w, m.DeleteCredential(id), nil)
+	default:
+		core.Error(w, 405, "method not allowed")
 	}
-	respond(w, m.DeleteCredential(id), nil)
 }
 func (m *Manager) filesHandler(w http.ResponseWriter, r *http.Request, id string) {
 	p := r.URL.Query().Get("path")
+	route := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+	allowed := (route == "files" && r.Method == "GET") || (route == "content" && (r.Method == "GET" || r.Method == "PUT")) || (route == "download" && r.Method == "GET") || (route == "upload" && r.Method == "POST")
+	if !allowed {
+		core.Error(w, 405, "method not allowed")
+		return
+	}
 	switch r.Method {
 	case "GET":
 		if strings.HasSuffix(r.URL.Path, "/download") {
@@ -203,7 +229,7 @@ func (m *Manager) filesHandler(w http.ResponseWriter, r *http.Request, id string
 		}
 		core.JSON(w, 200, map[string]string{"hash": h})
 	case "POST":
-		v, e := m.Upload(r.Context(), id, p, io.LimitReader(r.Body, 128<<20))
+		v, e := m.Upload(r.Context(), id, p, r.Body)
 		respond(w, e, v)
 	default:
 		core.Error(w, 405, "method not allowed")
@@ -212,21 +238,30 @@ func (m *Manager) filesHandler(w http.ResponseWriter, r *http.Request, id string
 func sameOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	u, err := url.Parse(origin)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host == r.Host
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return err == nil && u.Scheme == scheme && u.Host == r.Host && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == ""
+}
+func (m *Manager) terminalOrigin(r *http.Request) bool {
+	if m.AllowedOrigin == "" {
+		return sameOrigin(r)
+	}
+	u, e := url.Parse(m.AllowedOrigin)
+	return e == nil && (u.Scheme == "http" || u.Scheme == "https") && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == "" && u.Host == r.Host && r.Header.Get("Origin") == m.AllowedOrigin
 }
 func (m *Manager) terminalHandler(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != "GET" || !sameOrigin(r) {
+	if r.Method != "GET" || !m.terminalOrigin(r) {
 		core.Error(w, 403, "WebSocket origin refused")
 		return
 	}
-	u := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return sameOrigin(r) }, ReadBufferSize: 4096, WriteBufferSize: 4096}
+	u := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return m.terminalOrigin(r) }, ReadBufferSize: 4096, WriteBufferSize: 4096}
 	ws, e := u.Upgrade(w, r, nil)
 	if e != nil {
 		return
 	}
-	if e = m.ServeTerminal(context.Background(), id, ws); e != nil {
-		_ = ws.WriteJSON(terminalFrame{Type: "status", State: "closed", Message: e.Error()})
-	}
+	_ = m.ServeTerminalSession(r.Context(), id, r.URL.Query().Get("session"), ws)
 }
 func (m *Manager) tunnelsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
@@ -252,7 +287,7 @@ func (m *Manager) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 }
 func respond(w http.ResponseWriter, e error, v any) {
 	if e != nil {
-		if errors.Is(e, io.EOF) {
+		if errors.Is(e, io.EOF) || errors.Is(e, sql.ErrNoRows) {
 			core.Error(w, 404, "not found")
 		} else {
 			core.Error(w, 502, e.Error())

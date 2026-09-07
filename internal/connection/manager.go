@@ -4,6 +4,7 @@ package connection
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -48,11 +49,15 @@ type credentialRecord struct {
 }
 
 type Manager struct {
-	store       *core.Store
-	vault       *core.Vault
-	tunnels     *tunnelRegistry
-	dialTimeout time.Duration
-	mu          sync.RWMutex
+	// AllowedOrigin is the validated public origin supplied by the root server.
+	AllowedOrigin string
+	store         *core.Store
+	vault         *core.Vault
+	tunnels       *tunnelRegistry
+	dialTimeout   time.Duration
+	mu            sync.RWMutex
+	terminals     *terminalRegistry
+	filesMu       sync.Mutex
 }
 
 type Runner interface {
@@ -75,10 +80,23 @@ type HostKeyChangedError struct{}
 func (*HostKeyChangedError) Error() string { return "host key changed" }
 
 func New(store *core.Store, vault *core.Vault) *Manager {
-	return &Manager{store: store, vault: vault, tunnels: newTunnelRegistry(), dialTimeout: 20 * time.Second}
+	return &Manager{store: store, vault: vault, tunnels: newTunnelRegistry(), terminals: newTerminalRegistry(), dialTimeout: 20 * time.Second}
 }
 
 func (m *Manager) PutHost(h Host) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if h.ID == "local" {
+		return errors.New("local host is reserved")
+	}
+	var existing Host
+	err := m.store.Get(hostKind, h.ID, &existing)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil && h.HostKey != existing.HostKey {
+		return errors.New("host key must remain unchanged")
+	}
 	if h.ID == "" {
 		h.ID = core.ID()
 	}
@@ -96,13 +114,21 @@ func (m *Manager) PutHost(h Host) error {
 	}
 	return m.store.Put(hostKind, h.ID, h)
 }
-func (m *Manager) Host(id string) (Host, error) { var h Host; return h, m.store.Get(hostKind, id, &h) }
+func (m *Manager) Host(id string) (Host, error) {
+	if id == "local" {
+		return Host{ID: "local", Name: "Local engine", Address: "local", Group: "local"}, nil
+	}
+	var h Host
+	err := m.store.Get(hostKind, id, &h)
+	return h, err
+}
 func (m *Manager) Hosts() ([]Host, error) {
 	raw, e := m.store.List(hostKind)
 	if e != nil {
 		return nil, e
 	}
-	out := make([]Host, 0, len(raw))
+	out := make([]Host, 1, len(raw)+1)
+	out[0] = Host{ID: "local", Name: "Local engine", Address: "local", Group: "local"}
 	for _, v := range raw {
 		var h Host
 		if e = json.Unmarshal(v, &h); e != nil {
@@ -116,6 +142,8 @@ func (m *Manager) DeleteHost(id string) error { return m.store.Delete(hostKind, 
 
 // EnrollHostKey is the only path that changes a saved server key.
 func (m *Manager) EnrollHostKey(id, key string) (Host, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	h, err := m.Host(id)
 	if err != nil {
 		return Host{}, err
@@ -126,6 +154,9 @@ func (m *Manager) EnrollHostKey(id, key string) (Host, error) {
 	}
 	if _, _, _, _, err = ssh.ParseAuthorizedKey([]byte(key)); err != nil {
 		return Host{}, errors.New("invalid host key")
+	}
+	if h.HostKey != "" && hostKeyCallback(h.HostKey)("", nil, mustPublicKey(key)) != nil {
+		return Host{}, &HostKeyChangedError{}
 	}
 	h.HostKey = key
 	err = m.store.Put(hostKind, id, h)
@@ -197,70 +228,123 @@ func (m *Manager) TestHost(ctx context.Context, hostID string) (HostTestResult, 
 	defer c.Close()
 	return HostTestResult{Connected: true}, nil
 }
+
+// ownedConn closes every jump connection when the destination is closed.
+type ownedConn struct {
+	net.Conn
+	parents []*ssh.Client
+	once    sync.Once
+}
+
+func (c *ownedConn) Close() error {
+	var err error
+	c.once.Do(func() {
+		err = c.Conn.Close()
+		for i := len(c.parents) - 1; i >= 0; i-- {
+			_ = c.parents[i].Close()
+		}
+	})
+	return err
+}
 func (m *Manager) dialHost(ctx context.Context, h Host, seen map[string]bool) (*ssh.Client, error) {
-	if seen[h.ID] {
-		return nil, errors.New("jump host cycle")
-	}
-	seen[h.ID] = true
-	defer delete(seen, h.ID)
-	cfg, e := m.clientConfig(h)
-	if e != nil {
-		return nil, e
-	}
-	addr := net.JoinHostPort(h.Address, fmt.Sprint(h.Port))
-	var conn net.Conn
-	if len(h.JumpIDs) == 0 {
-		d := net.Dialer{Timeout: m.dialTimeout}
-		conn, e = d.DialContext(ctx, "tcp", addr)
-	} else {
-		// JumpIDs are ordered from the network edge toward the destination.
-		var jump *ssh.Client
-		for _, jumpID := range h.JumpIDs {
-			j, e2 := m.Host(jumpID)
-			if e2 != nil {
-				return nil, e2
-			}
-			jcfg, e2 := m.clientConfig(j)
-			if e2 != nil {
-				return nil, e2
-			}
-			jaddr := net.JoinHostPort(j.Address, fmt.Sprint(j.Port))
-			var jc net.Conn
-			if jump == nil {
-				jc, e2 = (&net.Dialer{Timeout: m.dialTimeout}).DialContext(ctx, "tcp", jaddr)
-			} else {
-				jc, e2 = jump.Dial("tcp", jaddr)
-			}
-			if e2 != nil {
-				if jump != nil {
-					_ = jump.Close()
-				}
-				return nil, e2
-			}
-			cc, ch, req, e2 := ssh.NewClientConn(jc, jaddr, jcfg)
-			if e2 != nil {
-				_ = jc.Close()
-				if jump != nil {
-					_ = jump.Close()
-				}
-				return nil, e2
-			}
-			jump = ssh.NewClient(cc, ch, req)
+	var chain []Host
+	var expand func(Host) error
+	expand = func(v Host) error {
+		if seen[v.ID] {
+			return errors.New("jump host cycle or duplicate")
 		}
-		conn, e = jump.Dial("tcp", addr)
+		seen[v.ID] = true
+		if len(seen) > 16 {
+			return errors.New("jump chain exceeds 16 hosts")
+		}
+		for _, id := range v.JumpIDs {
+			j, e := m.Host(id)
+			if e != nil {
+				return e
+			}
+			if e = expand(j); e != nil {
+				return e
+			}
+		}
+		chain = append(chain, v)
+		return nil
+	}
+	if err := expand(h); err != nil {
+		return nil, err
+	}
+	var clients []*ssh.Client
+	success := false
+	defer func() {
+		if !success {
+			for i := len(clients) - 1; i >= 0; i-- {
+				_ = clients[i].Close()
+			}
+		}
+	}()
+	for _, host := range chain {
+		cfg, err := m.clientConfig(host)
+		if err != nil {
+			return nil, err
+		}
+		addr := net.JoinHostPort(host.Address, fmt.Sprint(host.Port))
+		dialCtx, cancel := context.WithTimeout(ctx, m.dialTimeout)
+		var conn net.Conn
+		if len(clients) == 0 {
+			conn, err = (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+		} else {
+			conn, err = clients[len(clients)-1].DialContext(dialCtx, "tcp", addr)
+		}
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		// SSH channel connections do not implement deadlines. Cancellation closes
+		// the transport instead, bounding both direct and jump handshakes.
+		stop := context.AfterFunc(dialCtx, func() { _ = conn.Close() })
+		cc, ch, req, err := ssh.NewClientConn(&ownedConn{Conn: conn, parents: append([]*ssh.Client(nil), clients...)}, addr, cfg)
+		stopped := stop()
+		cancelled := dialCtx.Err()
+		cancel()
+		if err != nil || !stopped || cancelled != nil {
+			_ = conn.Close()
+			if err == nil {
+				err = context.DeadlineExceeded
+			}
+			return nil, err
+		}
+		clients = append(clients, ssh.NewClient(cc, ch, req))
+	}
+	success = true
+	return clients[len(clients)-1], nil
+}
+func mustPublicKey(s string) ssh.PublicKey {
+	k, _, _, _, _ := ssh.ParseAuthorizedKey([]byte(s))
+	return k
+}
+
+// UpdateCredential preserves encrypted material when the secret is omitted.
+func (m *Manager) UpdateCredential(id, name string, secret *[]byte) (CredentialMetadata, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var r credentialRecord
+	if e := m.store.Get(credentialKind, id, &r); e != nil {
+		return CredentialMetadata{}, e
+	}
+	if strings.TrimSpace(name) == "" {
+		return CredentialMetadata{}, errors.New("credential name required")
+	}
+	r.Name = name
+	if secret != nil {
+		if len(*secret) == 0 {
+			return CredentialMetadata{}, errors.New("credential secret required")
+		}
+		sealed, e := m.vault.Seal(*secret)
 		if e != nil {
-			_ = jump.Close()
+			return CredentialMetadata{}, e
 		}
+		r.Sealed = sealed
 	}
-	if e != nil {
-		return nil, e
-	}
-	c, ch, req, e := ssh.NewClientConn(conn, addr, cfg)
-	if e != nil {
-		_ = conn.Close()
-		return nil, e
-	}
-	return ssh.NewClient(c, ch, req), nil
+	return r.CredentialMetadata, m.store.Put(credentialKind, id, r)
 }
 func (m *Manager) clientConfig(h Host) (*ssh.ClientConfig, error) {
 	r, secret, e := m.credential(h.CredentialID)
@@ -309,6 +393,8 @@ func (m *Manager) RunWithOutput(ctx context.Context, hostID, command string, lim
 		return -1, nil, err
 	}
 	defer c.Close()
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
 	s, err := c.NewSession()
 	if err != nil {
 		return -1, nil, err
@@ -319,6 +405,9 @@ func (m *Manager) RunWithOutput(ctx context.Context, hostID, command string, lim
 	s.Stdout = writer
 	s.Stderr = writer
 	err = s.Run(command)
+	if ctx.Err() != nil {
+		return -1, []byte(out.String()), ctx.Err()
+	}
 	if writer.exceeded {
 		return -1, []byte(out.String()), errors.New("command output exceeds limit")
 	}
@@ -333,19 +422,23 @@ func (m *Manager) RunWithOutput(ctx context.Context, hostID, command string, lim
 }
 
 type limitedWriter struct {
+	mu       sync.Mutex
 	w        io.Writer
 	n        int
 	exceeded bool
 }
 
 func (w *limitedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	original := len(p)
 	if len(p) > w.n {
 		w.exceeded = true
 		p = p[:w.n]
 	}
 	n, e := w.w.Write(p)
 	w.n -= n
-	return len(p), e
+	return original, e
 }
 func clear(b []byte) {
 	for i := range b {
@@ -362,6 +455,8 @@ func (m *Manager) Run(ctx context.Context, hostID, command string) (int, error) 
 		return -1, e
 	}
 	defer c.Close()
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
 	s, e := c.NewSession()
 	if e != nil {
 		return -1, e
@@ -370,6 +465,9 @@ func (m *Manager) Run(ctx context.Context, hostID, command string) (int, error) 
 	s.Stdout = io.Discard
 	s.Stderr = io.Discard
 	e = s.Run(command)
+	if ctx.Err() != nil {
+		return -1, ctx.Err()
+	}
 	if e == nil {
 		return 0, nil
 	}
@@ -405,8 +503,12 @@ func HashText(b []byte) string {
 	s := sha256.Sum256(b)
 	return base64.RawURLEncoding.EncodeToString(s[:])
 }
-func safeRemotePath(path string) error {
-	if path == "" || !strings.HasPrefix(filepath.ToSlash(path), "/") || strings.Contains(path, "\x00") {
+func safeRemotePath(p string) error {
+	if strings.Contains(p, "\\") || path.Clean(p) != p {
+		return errors.New("canonical POSIX path required")
+	}
+	path := p
+	if path == "" || !strings.HasPrefix(path, "/") || strings.Contains(path, "\x00") {
 		return errors.New("absolute non-NUL path required")
 	}
 	return nil

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/core"
 )
 
 func TestSafeRemotePath(t *testing.T) {
@@ -53,8 +55,45 @@ func TestSameOriginRequiresExactHost(t *testing.T) {
 	if sameOrigin(r) {
 		t.Fatal("substring origin accepted")
 	}
-	r.Header.Set("Origin", "https://manager.test")
+	r.Header.Set("Origin", "http://manager.test")
 	if !sameOrigin(r) {
 		t.Fatal("exact origin rejected")
+	}
+}
+
+func TestParseSSHConfigReportsUnsupportedDirectives(t *testing.T) {
+	r := ParseSSHConfig("Host jump\n HostName jump.example\n User admin\nHost app\n HostName app.example\n Port 2200\n ProxyJump jump\n IdentityFile ~/.ssh/id\n")
+	if len(r.Hosts) != 2 {
+		t.Fatalf("hosts: %#v", r.Hosts)
+	}
+	if r.Hosts[1].Port != 2200 || len(r.Hosts[1].JumpIDs) != 1 || r.Hosts[1].JumpIDs[0] != "jump" {
+		t.Fatalf("app: %#v", r.Hosts[1])
+	}
+	if len(r.Unsupported) != 1 || r.Unsupported[0].Name != "IdentityFile" {
+		t.Fatalf("unsupported: %#v", r.Unsupported)
+	}
+}
+
+func TestHostReturnsStoredValueAndLocalSyntheticHost(t *testing.T) {
+	s, err := core.NewStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	v, err := core.NewVault(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(s, v)
+	if err := m.PutHost(Host{ID: "real", Name: "real", Address: "host", Port: 22, User: "u", CredentialID: "cred"}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := m.Host("real")
+	if err != nil || h.Name != "real" {
+		t.Fatalf("host %#v err %v", h, err)
+	}
+	local, err := m.Host("local")
+	if err != nil || local.ID != "local" {
+		t.Fatalf("local %#v %v", local, err)
 	}
 }
