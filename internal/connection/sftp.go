@@ -144,3 +144,30 @@ func (m *Manager) Download(ctx context.Context, id, p string, w io.Writer) error
 		return e
 	})
 }
+
+// WriteFile writes a bounded remote file through SFTP. Callers own any local
+// path containment policy; this method accepts only the remote absolute path.
+func (m *Manager) WriteFile(ctx context.Context, id, p string, data []byte) error {
+	if err := safeRemotePath(p); err != nil {
+		return err
+	}
+	if len(data) > 16<<20 {
+		return errors.New("file exceeds 16 MiB")
+	}
+	return m.withSFTP(ctx, id, func(s *sftp.Client) error {
+		tmp := p + ".container-ssh-manager-" + HashText(data)[:12] + ".tmp"
+		defer s.Remove(tmp)
+		f, err := s.OpenFile(tmp, 0x241)
+		if err != nil {
+			return err
+		}
+		if _, err = io.Copy(f, bytes.NewReader(data)); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err = f.Close(); err != nil {
+			return err
+		}
+		return s.Rename(tmp, p)
+	})
+}
