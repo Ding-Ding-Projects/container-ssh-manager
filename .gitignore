@@ -1,0 +1,8 @@
+node_modules/
+web/dist/
+*.exe
+*.db*
+.env
+secrets/
+data/
+work/
