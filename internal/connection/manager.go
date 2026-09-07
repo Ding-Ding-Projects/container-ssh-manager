@@ -55,6 +55,25 @@ type Manager struct {
 	mu          sync.RWMutex
 }
 
+type Runner interface {
+	Run(context.Context, string, string) (int, error)
+}
+type OutputRunner interface {
+	RunWithOutput(context.Context, string, string, int) (int, []byte, error)
+}
+type HostTestResult struct {
+	Connected          bool   `json:"connected"`
+	HostKey            string `json:"hostKey,omitempty"`
+	EnrollmentRequired bool   `json:"enrollmentRequired"`
+}
+type HostKeyEnrollmentError struct{ Key string }
+
+func (e *HostKeyEnrollmentError) Error() string { return "host key enrollment required" }
+
+type HostKeyChangedError struct{}
+
+func (*HostKeyChangedError) Error() string { return "host key changed" }
+
 func New(store *core.Store, vault *core.Vault) *Manager {
 	return &Manager{store: store, vault: vault, tunnels: newTunnelRegistry(), dialTimeout: 20 * time.Second}
 }
@@ -77,13 +96,21 @@ func (m *Manager) PutHost(h Host) error {
 	}
 	return m.store.Put(hostKind, h.ID, h)
 }
-func (m *Manager) Host(id string) (Host, error) { var h Host; return h, m.store.Get(hostKind, id, &h) }
+func (m *Manager) Host(id string) (Host, error) {
+	if id == "local" {
+		return Host{ID: "local", Name: "Local engine", Address: "local", Group: "local"}, nil
+	}
+	var h Host
+	err := m.store.Get(hostKind, id, &h)
+	return h, err
+}
 func (m *Manager) Hosts() ([]Host, error) {
 	raw, e := m.store.List(hostKind)
 	if e != nil {
 		return nil, e
 	}
-	out := make([]Host, 0, len(raw))
+	out := make([]Host, 1, len(raw)+1)
+	out[0] = Host{ID: "local", Name: "Local engine", Address: "local", Group: "local"}
 	for _, v := range raw {
 		var h Host
 		if e = json.Unmarshal(v, &h); e != nil {
@@ -94,6 +121,24 @@ func (m *Manager) Hosts() ([]Host, error) {
 	return out, nil
 }
 func (m *Manager) DeleteHost(id string) error { return m.store.Delete(hostKind, id) }
+
+// EnrollHostKey is the only path that changes a saved server key.
+func (m *Manager) EnrollHostKey(id, key string) (Host, error) {
+	h, err := m.Host(id)
+	if err != nil {
+		return Host{}, err
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return Host{}, errors.New("host key required")
+	}
+	if _, _, _, _, err = ssh.ParseAuthorizedKey([]byte(key)); err != nil {
+		return Host{}, errors.New("invalid host key")
+	}
+	h.HostKey = key
+	err = m.store.Put(hostKind, id, h)
+	return h, err
+}
 
 func (m *Manager) PutCredential(meta CredentialMetadata, secret []byte) (CredentialMetadata, error) {
 	if meta.ID == "" {
@@ -145,6 +190,21 @@ func (m *Manager) Dial(ctx context.Context, hostID string) (*ssh.Client, error) 
 	seen := map[string]bool{}
 	return m.dialHost(ctx, h, seen)
 }
+
+// TestHost connects using its configured credential and reports an unpinned key
+// for explicit enrollment. It never persists a discovered key automatically.
+func (m *Manager) TestHost(ctx context.Context, hostID string) (HostTestResult, error) {
+	c, err := m.Dial(ctx, hostID)
+	if err != nil {
+		var enrollment *HostKeyEnrollmentError
+		if errors.As(err, &enrollment) {
+			return HostTestResult{HostKey: enrollment.Key, EnrollmentRequired: true}, nil
+		}
+		return HostTestResult{}, err
+	}
+	defer c.Close()
+	return HostTestResult{Connected: true}, nil
+}
 func (m *Manager) dialHost(ctx context.Context, h Host, seen map[string]bool) (*ssh.Client, error) {
 	if seen[h.ID] {
 		return nil, errors.New("jump host cycle")
@@ -161,13 +221,39 @@ func (m *Manager) dialHost(ctx context.Context, h Host, seen map[string]bool) (*
 		d := net.Dialer{Timeout: m.dialTimeout}
 		conn, e = d.DialContext(ctx, "tcp", addr)
 	} else {
-		j, e2 := m.Host(h.JumpIDs[len(h.JumpIDs)-1])
-		if e2 != nil {
-			return nil, e2
-		}
-		jump, e2 := m.dialHost(ctx, j, seen)
-		if e2 != nil {
-			return nil, e2
+		// JumpIDs are ordered from the network edge toward the destination.
+		var jump *ssh.Client
+		for _, jumpID := range h.JumpIDs {
+			j, e2 := m.Host(jumpID)
+			if e2 != nil {
+				return nil, e2
+			}
+			jcfg, e2 := m.clientConfig(j)
+			if e2 != nil {
+				return nil, e2
+			}
+			jaddr := net.JoinHostPort(j.Address, fmt.Sprint(j.Port))
+			var jc net.Conn
+			if jump == nil {
+				jc, e2 = (&net.Dialer{Timeout: m.dialTimeout}).DialContext(ctx, "tcp", jaddr)
+			} else {
+				jc, e2 = jump.Dial("tcp", jaddr)
+			}
+			if e2 != nil {
+				if jump != nil {
+					_ = jump.Close()
+				}
+				return nil, e2
+			}
+			cc, ch, req, e2 := ssh.NewClientConn(jc, jaddr, jcfg)
+			if e2 != nil {
+				_ = jc.Close()
+				if jump != nil {
+					_ = jump.Close()
+				}
+				return nil, e2
+			}
+			jump = ssh.NewClient(cc, ch, req)
 		}
 		conn, e = jump.Dial("tcp", addr)
 		if e != nil {
@@ -209,17 +295,65 @@ func hostKeyCallback(pinned string) ssh.HostKeyCallback {
 	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
 		actual := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
 		if pinned == "" {
-			return fmt.Errorf("host key enrollment required: %s", actual)
+			return &HostKeyEnrollmentError{Key: actual}
 		}
 		want, _, _, _, e := ssh.ParseAuthorizedKey([]byte(pinned))
 		if e != nil {
 			return fmt.Errorf("invalid stored host key: %w", e)
 		}
 		if string(want.Marshal()) != string(key.Marshal()) {
-			return errors.New("host key changed")
+			return &HostKeyChangedError{}
 		}
 		return nil
 	}
+}
+
+func (m *Manager) RunWithOutput(ctx context.Context, hostID, command string, limit int) (int, []byte, error) {
+	if limit < 1 || limit > 4<<20 {
+		return -1, nil, errors.New("output limit must be between 1 and 4 MiB")
+	}
+	c, err := m.Dial(ctx, hostID)
+	if err != nil {
+		return -1, nil, err
+	}
+	defer c.Close()
+	s, err := c.NewSession()
+	if err != nil {
+		return -1, nil, err
+	}
+	defer s.Close()
+	var out strings.Builder
+	writer := &limitedWriter{w: &out, n: limit}
+	s.Stdout = writer
+	s.Stderr = writer
+	err = s.Run(command)
+	if writer.exceeded {
+		return -1, []byte(out.String()), errors.New("command output exceeds limit")
+	}
+	if err == nil {
+		return 0, []byte(out.String()), nil
+	}
+	var exit *ssh.ExitError
+	if errors.As(err, &exit) {
+		return exit.ExitStatus(), []byte(out.String()), nil
+	}
+	return -1, []byte(out.String()), err
+}
+
+type limitedWriter struct {
+	w        io.Writer
+	n        int
+	exceeded bool
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if len(p) > w.n {
+		w.exceeded = true
+		p = p[:w.n]
+	}
+	n, e := w.w.Write(p)
+	w.n -= n
+	return len(p), e
 }
 func clear(b []byte) {
 	for i := range b {

@@ -36,6 +36,7 @@ func (m *Manager) hostsHandler(w http.ResponseWriter, r *http.Request) {
 		var h Host
 		e := core.Decode(r, &h)
 		if e == nil {
+			h.ID = core.ID()
 			e = m.PutHost(h)
 		}
 		if e != nil {
@@ -80,6 +81,33 @@ func (m *Manager) hostHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch strings.Join(parts[1:], "/") {
+	case "test":
+		if !method(w, r, "POST") {
+			return
+		}
+		v, err := m.TestHost(r.Context(), id)
+		if err != nil {
+			hostError(w, err)
+			return
+		}
+		core.JSON(w, http.StatusOK, v)
+	case "enroll-host-key":
+		if !method(w, r, "POST") {
+			return
+		}
+		var q struct {
+			HostKey string `json:"hostKey"`
+		}
+		if err := core.Decode(r, &q); err != nil {
+			core.Error(w, 400, err.Error())
+			return
+		}
+		h, err := m.EnrollHostKey(id, q.HostKey)
+		if err != nil {
+			hostError(w, err)
+			return
+		}
+		core.JSON(w, http.StatusOK, h)
 	case "run":
 		if !method(w, r, "POST") {
 			return
@@ -237,4 +265,12 @@ func respond(w http.ResponseWriter, e error, v any) {
 		return
 	}
 	core.JSON(w, 200, v)
+}
+func hostError(w http.ResponseWriter, err error) {
+	var changed *HostKeyChangedError
+	if errors.As(err, &changed) {
+		core.Error(w, http.StatusConflict, "host key changed")
+		return
+	}
+	core.Error(w, http.StatusBadGateway, err.Error())
 }

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"github.com/pkg/sftp"
 	"io"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -17,6 +19,40 @@ type FileEntry struct {
 	Directory bool      `json:"directory"`
 	Size      int64     `json:"size"`
 	Modified  time.Time `json:"modified"`
+}
+
+// WriteComposeFile is intentionally narrower than a generic local writer. The
+// engine supplies a project directory and one approved Compose basename.
+func (m *Manager) WriteComposeFile(ctx context.Context, hostID, projectDir, base string, data []byte) error {
+	if base != "compose.yaml" && base != "compose.yml" && base != ".env" {
+		return errors.New("unsupported Compose file")
+	}
+	if len(data) > 16<<20 {
+		return errors.New("file exceeds 16 MiB")
+	}
+	if hostID != "local" {
+		return m.WriteFile(ctx, hostID, path.Join(projectDir, base), data)
+	}
+	if projectDir == "" || filepath.Base(projectDir) == "." {
+		return errors.New("project directory required")
+	}
+	target := filepath.Join(projectDir, base)
+	tmp, err := os.CreateTemp(projectDir, ".container-ssh-manager-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err = tmp.Write(data); err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmpName, target)
 }
 
 func (m *Manager) withSFTP(ctx context.Context, hostID string, fn func(*sftp.Client) error) error {
