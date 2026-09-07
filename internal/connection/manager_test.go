@@ -55,7 +55,7 @@ func TestSameOriginRequiresExactHost(t *testing.T) {
 	if sameOrigin(r) {
 		t.Fatal("substring origin accepted")
 	}
-	r.Header.Set("Origin", "https://manager.test")
+	r.Header.Set("Origin", "http://manager.test")
 	if !sameOrigin(r) {
 		t.Fatal("exact origin rejected")
 	}
