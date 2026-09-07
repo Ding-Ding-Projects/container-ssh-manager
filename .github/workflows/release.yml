@@ -1,0 +1,79 @@
+name: Build and publish portable container bundle
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.ORG_TOKEN || secrets.GITHUB_TOKEN }}
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.26.6'
+      - name: Record candidate provenance
+        run: |
+          echo "VERSION=0.1.${GITHUB_RUN_NUMBER}-r${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Build browser assets
+        run: |
+          npm ci --prefix web --no-audit --no-fund
+          cd web
+          npm exec vite build
+      - name: Build portable Linux bundle
+        run: sh scripts/package.sh
+      - name: Publish release
+        run: |
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq '.jobs | map(.started_at) | min')
+          cat > work/release-notes.md <<EOF
+          ## Container SSH Manager $VERSION
+          Portable Docker Compose deployment for private Linux networks, including amd64 and arm64 binaries.
+
+          Source commit: $GITHUB_SHA
+          Build started: $UPDATED_AT
+          Workflow started: $started
+
+          Download the bundle and checksum. Follow the included owner setup and local HTTPS documentation. Credentials are not included. The source repository is public; the running service remains private-network only.
+
+          This workflow builds and publishes. It runs no tests, lint, accessibility checks or browser verification. Local verification is documented separately; publication does not imply those checks passed.
+
+          ## 廣東話
+          呢個版本提供私人網絡用嘅 Compose 套件，包括兩種 Linux 架構。請按照文件設定擁有人帳戶同 HTTPS。發佈流程只負責編譯及上載，唔代表測試已通過。
+          EOF
+          gh release create "v$VERSION" "work/container-ssh-manager-$VERSION.tar.gz" "work/container-ssh-manager-$VERSION.sha256" --target "$GITHUB_SHA" --title "Container SSH Manager $VERSION" --notes-file work/release-notes.md
+          completed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          duration=$(( $(date -d "$completed" +%s) - $(date -d "$started" +%s) ))
+          printf '\nWorkflow completed: %s\nWorkflow duration: %02d:%02d:%02d\n' "$completed" "$((duration/3600))" "$((duration/60%60))" "$((duration%60))" >> work/release-notes.md
+          gh release edit "v$VERSION" --notes-file work/release-notes.md
+          gh release view "v$VERSION" --json tagName,isDraft,targetCommitish,assets > work/release-proof.json
+      - name: Collect safe build evidence
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          mkdir -p work/evidence
+          printf 'commit=%s\nrun=%s\nstatus=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" '${{ job.status }}' > work/evidence/run.txt
+          cp work/release-proof.json work/evidence/ 2>/dev/null || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          name: release-evidence
+          path: work/evidence/
+          if-no-files-found: warn
+          retention-days: 7

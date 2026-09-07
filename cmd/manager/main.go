@@ -13,6 +13,7 @@ import (
 	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/jobs"
 	assets "github.com/Ding-Ding-Projects/container-ssh-manager/web"
 	"golang.org/x/term"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -20,9 +21,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 )
 
 var version = "development"
@@ -57,7 +60,11 @@ func run() error {
 		if _, e = rand.Read(key); e != nil {
 			return e
 		}
-		_, e = f.Write(key)
+		var written int
+		written, e = f.Write(key)
+		if e == nil && written != len(key) {
+			e = io.ErrShortWrite
+		}
 		if e != nil {
 			return e
 		}
@@ -69,6 +76,17 @@ func run() error {
 		}
 		if e = os.Link(f.Name(), keyPath); e != nil {
 			return e
+		}
+		if runtime.GOOS != "windows" {
+			dir, e := os.Open(filepath.Dir(keyPath))
+			if e != nil {
+				return e
+			}
+			e = dir.Sync()
+			dir.Close()
+			if e != nil {
+				return e
+			}
 		}
 		if e == nil {
 			fmt.Println("Vault key created. Preserve it separately from database backups.")
@@ -152,6 +170,8 @@ func run() error {
 		core.JSON(w, 200, map[string]bool{"authenticated": true})
 	})
 	c := connection.New(s, vault)
+	c.AllowedOrigin = origin
+	defer c.Close()
 	c.Register(mux)
 	engine.New(s, c, vault).Register(mux)
 	j := jobs.New(s, c, vault)

@@ -2,9 +2,39 @@ package core
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestVaultFileBoundaries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "key")
+	if _, e := LoadVault(path); e == nil {
+		t.Fatal("missing key accepted")
+	}
+	if e := os.WriteFile(path, bytes.Repeat([]byte{7}, 32), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := LoadVault(path); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(path, bytes.Repeat([]byte{7}, 33), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := LoadVault(path); e == nil {
+		t.Fatal("oversized key accepted")
+	}
+	if _, e := LoadVault(dir); e == nil {
+		t.Fatal("directory accepted")
+	}
+	link := filepath.Join(dir, "link")
+	if e := os.Symlink(path, link); e == nil {
+		if _, e := LoadVault(link); e == nil {
+			t.Fatal("symlink accepted")
+		}
+	}
+}
 
 func TestVaultAuthenticatedEncryption(t *testing.T) {
 	v, _ := NewVault(bytes.Repeat([]byte{3}, 32))

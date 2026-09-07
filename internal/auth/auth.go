@@ -91,9 +91,27 @@ func (a *Auth) attempt(r *http.Request, success bool) {
 	b.Count++
 	a.attempts[ip] = b
 }
-func (a *Auth) prune() error {
-	_, e := a.Store.DB.Exec(`DELETE FROM records WHERE kind='session' AND (json_extract(data,'$.expires') < ? OR id IN (SELECT id FROM records WHERE kind='session' ORDER BY updated_at DESC LIMIT -1 OFFSET 15))`, time.Now().UTC().Format(time.RFC3339Nano))
-	return e
+func (a *Auth) storeSession(token string, expiry time.Time) error {
+	tx, e := a.Store.DB.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, e = tx.Exec(`DELETE FROM records WHERE kind='session' AND julianday(json_extract(data,'$.expires')) < julianday(?)`, stamp); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`DELETE FROM records WHERE kind='session' AND id IN (SELECT id FROM records WHERE kind='session' ORDER BY updated_at DESC,id DESC LIMIT -1 OFFSET 14)`); e != nil {
+		return e
+	}
+	body, e := json.Marshal(session{expiry.UTC()})
+	if e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`INSERT INTO records(kind,id,data,updated_at) VALUES('session',?,?,?)`, key(token), string(body), stamp); e != nil {
+		return e
+	}
+	return tx.Commit()
 }
 func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	select {
@@ -121,13 +139,9 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.attempt(r, true)
-	if a.prune() != nil {
-		core.Error(w, 500, "Session storage unavailable")
-		return
-	}
 	token := core.ID() + core.ID()
 	expiry := time.Now().Add(12 * time.Hour)
-	if a.Store.Put("session", key(token), session{expiry}) != nil {
+	if a.storeSession(token, expiry) != nil {
 		core.Error(w, 500, "Session unavailable")
 		return
 	}

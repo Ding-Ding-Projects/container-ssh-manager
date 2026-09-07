@@ -3056,6 +3056,47 @@
         }
       }
     },
+    "/api/v1/jobs/runs/{id}/output": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "GET /api/v1/jobs/runs/{id}/output",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Operation result; see API article for exact representation."
+          },
+          "202": {
+            "description": "Accepted durable operation; poll its returned identifier."
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Owner sign-in required"
+          },
+          "403": {
+            "description": "Origin rejected"
+          },
+          "409": {
+            "description": "Conflict or changed state"
+          },
+          "502": {
+            "description": "Host or engine operation unavailable"
+          }
+        }
+      }
+    },
     "/api/v1/jobs/runs/{id}/cancel": {
       "post": {
         "tags": [

@@ -7,8 +7,34 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+func TestSessionCapAtomic(t *testing.T) {
+	s, e := core.NewStore(filepath.Join(t.TempDir(), "sessions.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	a := New(s, "https://manager.test")
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if e := a.storeSession(core.ID(), time.Now().Add(time.Hour)); e != nil {
+				t.Error(e)
+			}
+		}()
+	}
+	wg.Wait()
+	var count int
+	if e = s.DB.QueryRow(`SELECT count(*) FROM records WHERE kind='session'`).Scan(&count); e != nil || count != 15 {
+		t.Fatalf("count=%d error=%v", count, e)
+	}
+}
 
 func TestProxyIdentityAndAttemptIsolation(t *testing.T) {
 	a := New(nil, "https://manager.test")

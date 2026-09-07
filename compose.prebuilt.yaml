@@ -1,0 +1,4 @@
+services:
+  manager:
+    build:
+      dockerfile: Dockerfile.prebuilt

@@ -105,7 +105,12 @@ func NewVault(key []byte) (*Vault, error) {
 	return &Vault{a}, e
 }
 func LoadVault(path string) (*Vault, error) {
-	info, err := os.Lstat(path)
+	f, err := openVaultFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("vault key unavailable: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("vault key unavailable: %w", err)
 	}
@@ -115,7 +120,7 @@ func LoadVault(path string) (*Vault, error) {
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
 		return nil, errors.New("vault key permissions must be owner-only")
 	}
-	key, e := os.ReadFile(path)
+	key, e := io.ReadAll(io.LimitReader(f, 33))
 	if e != nil {
 		return nil, fmt.Errorf("vault key unavailable: %w", e)
 	}
