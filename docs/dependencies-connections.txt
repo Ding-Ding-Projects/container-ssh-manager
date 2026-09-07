@@ -1,0 +1,5 @@
+golang.org/x/crypto/ssh: SSH client, auth methods, host-key verification, forwarding.
+github.com/pkg/sftp: SFTP listing, transfer and text editing transport.
+github.com/gorilla/websocket: authenticated terminal WebSocket transport.
+
+The root integrator owns adding these requirements to go.mod and go.sum.
