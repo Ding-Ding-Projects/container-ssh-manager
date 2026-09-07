@@ -1,0 +1,8 @@
+stdlib only in this lane.
+
+Integration requirements supplied by sibling lanes:
+- internal/core for Store records, JSON decoding, and HTTP JSON/error helpers.
+- internal/connection for host-scoped Docker transport and controlled host commands.
+
+No Docker SDK is used. The engine speaks the Docker Engine HTTP API through the
+connection manager, so transport ownership stays in one place.
