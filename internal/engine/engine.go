@@ -61,6 +61,14 @@ func (m *Manager) docker(w http.ResponseWriter, r *http.Request, path string) {
 		core.Error(w, 400, "hostId is required")
 		return
 	}
+	if len(parts) == 2 && parts[0] == "images" && (parts[1] == "pull" || parts[1] == "build") && r.Method == http.MethodPost {
+		m.startImageOperation(w, hostID, parts[1], body)
+		return
+	}
+	if len(parts) == 3 && parts[0] == "containers" && parts[2] == "exec" && r.Method == http.MethodPost {
+		m.execContainer(w, r, hostID, parts[1], body)
+		return
+	}
 	apiPath, method, stream, err := dockerRoute(r.Method, parts, r.URL.Query())
 	if err != nil {
 		core.Error(w, 400, err.Error())
@@ -71,6 +79,89 @@ func (m *Manager) docker(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 	m.proxy(w, r, hostID, method, apiPath, body, stream)
+}
+
+type execRequest struct {
+	Cmd        []string `json:"cmd"`
+	Env        []string `json:"env,omitempty"`
+	WorkingDir string   `json:"workingDir,omitempty"`
+	User       string   `json:"user,omitempty"`
+	TTY        bool     `json:"tty"`
+}
+
+func (m *Manager) execContainer(w http.ResponseWriter, r *http.Request, hostID, id string, body []byte) {
+	if !safeRecordID(id) {
+		core.Error(w, 400, "invalid resource id")
+		return
+	}
+	var in execRequest
+	if json.Unmarshal(body, &in) != nil || len(in.Cmd) == 0 {
+		core.Error(w, 400, "cmd is required")
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{"Cmd": in.Cmd, "Env": in.Env, "WorkingDir": in.WorkingDir, "User": in.User, "Tty": in.TTY, "AttachStdout": true, "AttachStderr": true})
+	created, status, err := m.engineJSON(r.Context(), hostID, http.MethodPost, "/containers/"+url.PathEscape(id)+"/exec", payload)
+	if err != nil {
+		core.Error(w, status, "cannot create container exec")
+		return
+	}
+	var createdBody struct {
+		ID string `json:"Id"`
+	}
+	if json.Unmarshal(created, &createdBody) != nil || createdBody.ID == "" {
+		core.Error(w, 502, "engine did not return an exec id")
+		return
+	}
+	output, status, err := m.engineJSON(r.Context(), hostID, http.MethodPost, "/exec/"+url.PathEscape(createdBody.ID)+"/start", []byte(fmt.Sprintf(`{"Detach":false,"Tty":%t}`, in.TTY)))
+	if err != nil {
+		core.Error(w, status, "container exec interrupted; outcome is unknown")
+		return
+	}
+	inspect, status, err := m.engineJSON(r.Context(), hostID, http.MethodGet, "/exec/"+url.PathEscape(createdBody.ID)+"/json", nil)
+	if err != nil {
+		core.Error(w, status, "container exec finished with unknown status")
+		return
+	}
+	var state struct {
+		ExitCode *int `json:"ExitCode"`
+		Running  bool `json:"Running"`
+	}
+	_ = json.Unmarshal(inspect, &state)
+	if state.Running || state.ExitCode == nil {
+		core.Error(w, 502, "container exec outcome is unknown")
+		return
+	}
+	core.JSON(w, 200, map[string]any{"id": createdBody.ID, "exitCode": *state.ExitCode, "output": string(output)})
+}
+
+func (m *Manager) engineJSON(ctx context.Context, hostID, method, path string, body []byte) ([]byte, int, error) {
+	client, base, closer, err := m.connections.EngineClient(ctx, hostID)
+	if err != nil {
+		return nil, 502, err
+	}
+	defer closer.Close()
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, 502, err
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + path
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, 500, err
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 502, err
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode >= 400 {
+		return out, resp.StatusCode, fmt.Errorf("engine status %d", resp.StatusCode)
+	}
+	return out, resp.StatusCode, nil
 }
 
 func (m *Manager) proxy(w http.ResponseWriter, r *http.Request, hostID, method, apiPath string, body []byte, stream bool) {
@@ -284,7 +375,7 @@ func validatePayload(resource, method string, body []byte) error {
 // operation records are intentionally unavailable until a durable background runner
 // lands. The facade never claims an interrupted engine stream completed.
 func (m *Manager) operation(w http.ResponseWriter, r *http.Request, path string) {
-	core.Error(w, http.StatusNotImplemented, "operation storage is not available")
+	m.operationHandler(w, r, path)
 }
 
 // EngineClient contract is checked here at compile time when connection lands.

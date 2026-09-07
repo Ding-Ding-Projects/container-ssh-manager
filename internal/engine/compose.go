@@ -191,11 +191,11 @@ func (m *Manager) openRevision(revision composeRevision) (composeFiles, error) {
 }
 
 func (m *Manager) writeComposeFiles(ctx context.Context, p *composeProject, files composeFiles) error {
-	if err := m.connections.WriteFile(ctx, p.HostID, filepath.Join(p.Path, "compose.yaml"), []byte(files.Compose)); err != nil {
+	if err := m.connections.WriteComposeFile(ctx, p.HostID, p.Path, "compose.yaml", []byte(files.Compose)); err != nil {
 		return err
 	}
 	if files.Environment != "" {
-		return m.connections.WriteFile(ctx, p.HostID, filepath.Join(p.Path, ".env"), []byte(files.Environment))
+		return m.connections.WriteComposeFile(ctx, p.HostID, p.Path, ".env", []byte(files.Environment))
 	}
 	return nil
 }
@@ -251,7 +251,9 @@ func composeCommand(path, action string, r *http.Request) string {
 	return ""
 }
 func shellQuote(v string) string { return "'" + strings.ReplaceAll(v, "'", "'\\''") + "'" }
-func safeRecordID(v string) bool { return v != "" && !strings.ContainsAny(v, "/\\\x00") }
+func safeRecordID(v string) bool {
+	return v != "" && v != "." && v != ".." && !strings.ContainsAny(v, "/\\\x00")
+}
 func safeName(v string) bool {
 	return v != "" && len(v) <= 128 && !strings.ContainsAny(v, "/\\\x00\r\n")
 }

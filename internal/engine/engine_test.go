@@ -13,6 +13,12 @@ func TestDockerRouteRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestSafeRecordIDRejectsDotSegments(t *testing.T) {
+	if safeRecordID(".") || safeRecordID("..") || !safeRecordID("abc_123") {
+		t.Fatal("unsafe record identifier validation")
+	}
+}
+
 func TestDockerRouteContainerLogDefaults(t *testing.T) {
 	path, method, stream, err := dockerRoute(http.MethodGet, []string{"containers", "abc", "logs"}, url.Values{})
 	if err != nil || method != http.MethodGet || !stream || path != "/containers/abc/logs?stdout=true&stderr=true&tail=&timestamps=false" {
