@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -73,7 +74,10 @@ func newTestManager(t *testing.T) *Manager {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Manager{store: store, location: loc, now: time.Now, running: make(map[string]context.CancelFunc), sem: make(chan struct{}, maxRunning)}
+	m := New(store, nil, nil)
+	m.location = loc
+	t.Cleanup(func() { m.Close(); m.wg.Wait() })
+	return m
 }
 
 func addRevision(t *testing.T, m *Manager) Revision {
@@ -121,7 +125,7 @@ func TestRestartMarksIncompleteRunsUnknownWithoutReplay(t *testing.T) {
 	}
 }
 
-func TestGlobalConcurrencyIsFourAndExcessIsSkipped(t *testing.T) {
+func TestGlobalConcurrencyIsFourAndExcessIsQueued(t *testing.T) {
 	m := newTestManager(t)
 	addRevision(t, m)
 	started := make(chan struct{}, maxRunning)
@@ -138,27 +142,23 @@ func TestGlobalConcurrencyIsFourAndExcessIsSkipped(t *testing.T) {
 	for i := 0; i < maxRunning; i++ {
 		<-started
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	skipped := 0
-	for time.Now().Before(deadline) {
-		skipped = 0
-		for _, run := range runs {
-			var persisted Run
-			if m.store.Get("job_run", run.ID, &persisted) == nil && persisted.Status == "skipped_capacity" {
-				skipped++
-			}
+	queued := 0
+	for _, run := range runs {
+		var persisted Run
+		if err := m.store.Get("job_run", run.ID, &persisted); err != nil {
+			t.Fatal(err)
 		}
-		if skipped == 1 {
-			break
+		if persisted.Status == "queued" {
+			queued++
 		}
-		time.Sleep(time.Millisecond)
 	}
-	if skipped != 1 {
-		t.Fatalf("skipped capacity count = %d, want 1", skipped)
+	if queued != 1 {
+		t.Fatalf("queued count = %d, want 1", queued)
 	}
+
 	close(release)
 	for _, run := range runs {
-		waitRun(t, m, run.ID, "succeeded", "skipped_capacity")
+		waitRun(t, m, run.ID, "succeeded")
 	}
 }
 
@@ -168,12 +168,12 @@ func TestHostOverlapIsRejectedAfterTheFirstRunStarts(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	m.run = func(context.Context, string, string) (int, error) { close(started); <-release; return 0, nil }
-	first, err := m.submit(context.Background(), Run{HostID: "host-1", RevisionID: "revision-1", Source: "schedule", Intent: "AUTOAPPROVED"})
+	first, err := m.submit(context.Background(), Run{HostID: "host-1", RevisionID: "revision-1", ScheduleID: "schedule-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-started
-	if _, err := m.submit(context.Background(), Run{HostID: "host-1", RevisionID: "revision-1", Source: "schedule", Intent: "AUTOAPPROVED"}); err == nil {
+	if _, err := m.submit(context.Background(), Run{HostID: "host-1", RevisionID: "revision-1", ScheduleID: "schedule-1"}); err == nil {
 		t.Fatal("overlapping host run was accepted")
 	}
 	var persisted Run
@@ -239,8 +239,9 @@ func TestExplicitOutputRetentionEncryptsAndBoundsTheRecord(t *testing.T) {
 		t.Fatal("plaintext output was stored")
 	}
 	plain, err := vault.Open(record.Ciphertext)
-	if err != nil || string(plain) != "private output" {
-		t.Fatalf("encrypted output = %q, %v", plain, err)
+	var envelope outputEnvelope
+	if err != nil || json.Unmarshal(plain, &envelope) != nil || string(envelope.Output) != "private output" || envelope.RunID != run.ID || envelope.RevisionID != revision.ID || envelope.MaxBytes != 32 {
+		t.Fatal("encrypted output identity, bound, or bytes did not match")
 	}
 }
 
