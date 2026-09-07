@@ -509,12 +509,14 @@ export async function composePage(
   );
   projects.forEach((p) => {
     const path = base + "/" + segment(p.id);
-    root.append(
-      panel(
+    const pending = Boolean(p.pending);
+    const recoveryExplanation = 'An incomplete paired-file write requires recovery. Editing, restoring, validation, deployment, and lifecycle commands are disabled until the journaled original files are recovered. Independent server-side edits are preserved; recovery may refuse an unsafe overwrite.';
+    const operationButton = (label:string,action:()=>void|Promise<void>,blocked=pending):HTMLElement => {const control=button(label,action);(control as any).disabled=blocked;if(blocked){control.setAttribute('aria-disabled','true');control.title='Recover the paired Compose files before this action.';}return control;};
+    const card = panel(
         p.name,
         el("p", p.path),
         row(
-          button("Read and edit files", async () => {
+          operationButton("Read and edit files", async () => {
             const current = await request(path + "/files"),
               yaml = field("Compose YAML", current.compose || "", "textarea"),
               env = field(
@@ -524,7 +526,7 @@ export async function composePage(
               );
             yaml.rows = 16;
             env.rows = 8;
-            dialog(
+            const editor = dialog(
               "Compose files",
               stack(
                 el(
@@ -535,10 +537,13 @@ export async function composePage(
                 env,
               ),
               async () => {
-                await request(path + "/files", "PUT", {
+                const lockEditor = () => {const save=editor.querySelector('[data-action="save"]');save?.replaceWith(operationButton('Save',()=>{},true));yaml.readOnly=true;env.readOnly=true;editor.querySelector('[slot="content"]')?.prepend(el('p',recoveryExplanation));};
+                const latest=await request(path);
+                if(latest.pending){lockEditor();await refresh();throw Error(recoveryExplanation);}
+                try {await request(path + "/files", "PUT", {
                   compose: yaml.value,
                   environment: env.value,
-                });
+                });}catch(error){try{if((await request(path)).pending){lockEditor();await refresh();}}catch{/* Preserve the original write error if metadata is unavailable. */}throw error;}
                 yaml.value = "";
                 env.value = "";
                 await refresh();
@@ -553,7 +558,7 @@ export async function composePage(
                 ...list(project.revisions).map((r) =>
                   row(
                     el("span", `Revision ${r.number} · ${r.createdAt}`),
-                    button("Restore", () =>
+                    operationButton("Restore", () =>
                       confirmAction(
                         "Restore Compose files",
                         "revision " + r.number,
@@ -565,39 +570,38 @@ export async function composePage(
                           );
                           await refresh();
                         },
-                      ),
+                      ), Boolean(project.pending) || pending,
                     ),
                   ),
                 ),
               ),
             );
           }),
-          button("Validate", async () =>
+          operationButton("Validate", async () =>
             showResult(
               "Compose validation",
               await request(path + "/validate", "POST", {}),
             ),
           ),
-          button("Deploy", () => {
+          operationButton("Deploy", () => {
             const pull = check("Pull images", true),
-              build = check("Build images"),
-              detach = check("Run detached", true);
+              build = check("Build images");
             dialog(
               "Deploy Compose project",
-              stack(pull.node, build.node, detach.node),
+              stack(pull.node, build.node, el('p','Services run in the background. Inspect their live status from Containers.')),
               async () =>
                 showResult(
                   "Compose deployment",
                   await request(path + "/deploy", "POST", {
                     pull: pull.input.checked,
                     build: build.input.checked,
-                    detach: detach.input.checked,
+                    detach: true,
                   }),
                 ),
               "Deploy",
             );
           }),
-          button("Stop", () =>
+          operationButton("Stop", () =>
             dialog(
               "Stop Compose project",
               el("p", `Stop services in ${p.name}?`),
@@ -609,34 +613,36 @@ export async function composePage(
               "Stop",
             ),
           ),
-          button("Down", () => {
-            const volumes = check("Remove volumes"),
-              images = select("Remove images", [
-                { value: "", label: "Keep images" },
-                { value: "local", label: "Local images" },
-                { value: "all", label: "All service images" },
-              ]);
+          operationButton("Down", () => {
             const proof = field("Type REMOVE to confirm");
             dialog(
               "Remove Compose resources",
-              stack(volumes.node, images, proof),
+              stack(el('p',`Remove the services and project networks for ${p.name} at ${p.path}. Volumes and images are preserved.`),proof),
               async () => {
                 if (proof.value !== "REMOVE")
                   throw Error("Confirmation must be REMOVE");
                 showResult(
                   "Compose down",
-                  await request(path + "/down", "POST", {
-                    volumes: volumes.input.checked,
-                    images: images.value,
-                  }),
+                  await request(path + "/down", "POST", {}),
                 );
               },
               "Remove",
             );
           }),
         ),
-      ),
-    );
+      );
+    if(pending){
+      const recovery=panel('File recovery required',el('p',recoveryExplanation),button('Recover files',()=>{
+        const confirmation=field('Type RECOVER to confirm');
+        dialog('Recover Compose files',stack(el('p',`Project: ${p.name}. Host: ${state.hosts.find(host=>host.id===hostId)?.name||hostId}. Directory: ${p.path}. Project ID: ${p.id}.`),el('p','Restore the journaled original compose.yaml and .env file pair. This does not deploy services. Recovery will refuse if either file changed independently.'),confirmation),async()=>{
+          if(confirmation.value!=='RECOVER')throw Error('Confirmation must be RECOVER');
+          await request(path+'/recover','POST',{});
+          await refresh();
+        },'Recover files');
+      },true));
+      recovery.setAttribute('role','status');card.insertBefore(recovery,card.lastElementChild);
+    }
+    root.append(card);
   });
   if (!projects.length) root.append(el("p", "No projects on this host."));
   return root;
