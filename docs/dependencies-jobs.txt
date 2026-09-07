@@ -1,0 +1,3 @@
+# Jobs lane dependency inventory
+
+No new module requirements are needed. Cron parsing, scheduling, HTTP handlers, synchronization, cancellation, and timezone handling use the Go standard library. The main integrator remains the only owner of go.mod and go.sum.
