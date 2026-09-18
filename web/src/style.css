@@ -255,6 +255,10 @@ a {
   gap: 8px;
   z-index: 10000;
   max-width: min(560px, calc(100vw - 36px));
+  max-height: 35vh;
+  max-height: 35dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .notice {
   display: flex;
@@ -266,6 +270,7 @@ a {
   box-shadow: 0 4px 24px #0004;
   border-radius: 16px;
   overflow-wrap: anywhere;
+  flex-shrink: 0;
 }
 .notice.error {
   border-color: var(--md-sys-color-error);

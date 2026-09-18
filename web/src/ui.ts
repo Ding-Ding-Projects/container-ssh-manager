@@ -114,17 +114,28 @@ export function pre(data: unknown): HTMLElement {
     "output",
   );
 }
+const notificationState = new WeakMap<HTMLElement,{message:string;error:boolean;timer?:ReturnType<typeof setTimeout>}>();
 export function notify(message: string, error = false): void {
   const region = document.getElementById("notifications");
   if (!region) return;
+  const remove=(node:HTMLElement)=>{clearTimeout(notificationState.get(node)?.timer);node.remove();};
+  const expire=(node:HTMLElement)=>{const data=notificationState.get(node);if(!data||data.error)return;clearTimeout(data.timer);data.timer=setTimeout(()=>remove(node),8000);};
+  const existing=Array.from(region.children).find(node=>{const data=notificationState.get(node as HTMLElement);return data?.message===message&&data.error===error;}) as HTMLElement|undefined;
+  if(existing){region.append(existing);expire(existing);return;}
+  while(region.childElementCount>=4){const firstInfo=Array.from(region.children).find(node=>!notificationState.get(node as HTMLElement)?.error) as HTMLElement|undefined;if(!firstInfo&&!error)return;remove(firstInfo||region.firstElementChild as HTMLElement);}
   const node = el("div", "", error ? "notice error" : "notice");
+  notificationState.set(node,{message,error});
   node.setAttribute("role", error ? "alert" : "status");
   node.append(
     el("span", message),
-    button("Dismiss", () => node.remove()),
+    button("Dismiss", () => remove(node)),
   );
+  node.addEventListener('pointerenter',()=>clearTimeout(notificationState.get(node)?.timer));
+  node.addEventListener('pointerleave',()=>expire(node));
+  node.addEventListener('focusin',()=>clearTimeout(notificationState.get(node)?.timer));
+  node.addEventListener('focusout',()=>expire(node));
   region.append(node);
-  while (region.childElementCount > 5) region.firstElementChild?.remove();
+  expire(node);
 }
 export function dialog(
   title: string,

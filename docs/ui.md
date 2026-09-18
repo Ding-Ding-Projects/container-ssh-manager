@@ -18,7 +18,7 @@ The shell has responsive host selection and navigation, persistent-in-memory wor
 | Images | List/filter, pull, build from a host directory, tag, remove, operation polling and cancellation | `/api/v1/engine/images`, `/api/v1/engine/operations/{id}` |
 | Volumes | List from the `Volumes` response envelope, create with driver/options/labels, inspect, remove | `/api/v1/engine/volumes` |
 | Networks | List, create with driver/options/labels/internal/attachable, inspect, connect/disconnect a selected real container, remove | `/api/v1/engine/networks` |
-| Compose | Create/adopt, read current YAML/environment, edit/save both, inspect revisions, restore, validate, deploy with pull/build/detach options, stop, down with explicit volume/image removal options | `/api/v1/engine/compose/projects` |
+| Compose | Create/adopt, read current YAML/environment, edit/save both, inspect revisions, restore, validate, detached deployment with pull/build options, stop, down preserving volumes/images, explicit paired-file recovery | `/api/v1/engine/compose/projects` |
 | Terminal | xterm input/output, fit/resize, same-session reconnect, explicit new session and close | `/api/v1/hosts/{id}/terminal?session=` WebSocket |
 | Files | Browse/filter/parent directory, download, upload confirmation, text editor, hash-checked save, conflict preservation and explicit reload | Per-host `/files` routes |
 | Tunnels | Start local/reverse forwarding, list exact host tunnels, refresh, stop | `/api/v1/tunnels` |
@@ -29,6 +29,8 @@ The shell has responsive host selection and navigation, persistent-in-memory wor
 New schedules are disabled by default. Enabling a schedule explicitly selects unattended `AUTOAPPROVED` execution. Output retention is disabled by default. The server's recorded outcome remains authoritative: a cancellation request is not reported as confirmed process termination.
 
 Container and image deletion target the resource with `DELETE`; no invented `/remove` action is used. Destructive resource forms require `REMOVE`, identify the resource, and leave force/volume removal off until explicitly selected. Compose restores and tunnel stops also confirm the exact target.
+
+Compose metadata with `pending.state: "recovery_required"` exposes a visible recovery explanation and disables file editing, restores, validation, deployment, stop, and down. `Recover files` identifies the project name, host, directory, and identifier and requires `RECOVER` before `POST /api/v1/engine/compose/projects/{id}/recover`. Controls are enabled only after successful recovery and refreshed metadata. Recovery restores the journaled original file pair and refuses to overwrite independent changes; it does not deploy services. Save rechecks metadata before writing. If a pending journal appears while the editor is open, its draft remains visible and read-only with Save disabled. Compose down preserves images and volumes, and deployment always runs detached, matching the backend's supported execution contract.
 
 Terminal identifiers remain in memory. Reconnection attaches to the server's original session and resets the local terminal before the server's bounded replay, avoiding duplicate output. Automatic reconnect is bounded to three attempts; explicit Reattach remains available. Tab disposal closes its socket, observer, timers, and terminal. SSH sessions are not available for the synthetic local-engine host.
 

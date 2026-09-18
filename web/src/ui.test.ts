@@ -9,10 +9,11 @@ import {
   positiveInteger,
   objectJSON,
   refreshLocalizedControls,
+  notify,
 } from "./ui";
 import { APIError, request, url, engineURL, list } from "./api";
 import { readPreferences, state } from "./state";
-import { enginePage } from "./engine";
+import { enginePage,composePage } from "./engine";
 import { filesPage, hostsPage } from "./connections";
 import { commandsPage, schedulesPage,hostChoices } from "./jobs";
 class TestDialog extends HTMLElement {
@@ -59,6 +60,9 @@ const click = async (label: string, scope: ParentNode = document) => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 };
 describe("safe components and dialog actions", () => {
+  it('coalesces repeated information and keeps a bounded queue',()=>{for(let count=0;count<8;count++)notify('Preferences saved');expect(document.querySelectorAll('.notice')).toHaveLength(1);for(let count=0;count<8;count++)notify('Information '+count);expect(document.querySelectorAll('.notice')).toHaveLength(4);});
+  it('expires information but keeps errors until dismissed',()=>{vi.useFakeTimers();try{notify('Saved');notify('Unable to save',true);vi.advanceTimersByTime(8000);expect(document.querySelectorAll('.notice')).toHaveLength(1);expect(document.querySelector('[role=alert]')?.textContent).toContain('Unable to save');vi.advanceTimersByTime(60000);expect(document.querySelector('[role=alert]')).not.toBeNull();}finally{vi.useRealTimers();}});
+  it('does not evict persistent errors to show routine information',()=>{for(let count=0;count<4;count++)notify('Error '+count,true);notify('Preferences saved');expect(document.querySelectorAll('[role=alert]')).toHaveLength(4);expect(document.querySelector('[role=status]')).toBeNull();});
   it("updates existing labels in Cantonese and bilingual modes and restores English", () => {
     const action = button("Save", () => {}),
       input = field("Name");
@@ -200,6 +204,20 @@ describe("preferences", () => {
     }));
 });
 describe("management controls bind real API routes", () => {
+  it('Compose down preserves images and volumes and deployment always runs detached',async()=>{
+    const project={id:'project-one',hostId:'host & one',name:'Production',path:'/srv/project'},fetcher=vi.fn().mockImplementation((path:string,init:RequestInit)=>Promise.resolve(response(init.method==='POST'?{ok:true}:[project])));vi.stubGlobal('fetch',fetcher);document.body.append(await composePage());await click('Down');let form=document.querySelector('md-dialog')!;expect(form.textContent).toContain('Volumes and images are preserved');expect(form.querySelector('md-checkbox')).toBeNull();(form.querySelector('md-outlined-text-field') as any).value='REMOVE';await click('Remove',form);const down=fetcher.mock.calls.find(call=>call[0].endsWith('/down'));expect(JSON.parse(down?.[1].body)).toEqual({});await click('Close',document.querySelector('md-dialog')!);await click('Deploy');form=document.querySelector('md-dialog')!;expect(form.querySelectorAll('md-checkbox')).toHaveLength(2);await click('Deploy',form);const deploy=fetcher.mock.calls.find(call=>call[0].endsWith('/deploy'));expect(JSON.parse(deploy?.[1].body)).toEqual({pull:true,build:false,detach:true});
+  });
+  it('blocks Compose editing and lifecycle actions until confirmed file recovery succeeds',async()=>{
+    const project={id:'project-one',hostId:'host & one',name:'Production',path:'/srv/project',pending:{state:'recovery_required'},revisions:[{number:1,createdAt:'2026-09-07'}]};let recovered=false;
+    const fetcher=vi.fn().mockImplementation((path:string,init:RequestInit)=>{if(path.endsWith('/recover')){recovered=true;return Promise.resolve(response({ok:true}));}const record={...project,...(recovered?{pending:undefined}:{})};return Promise.resolve(response(path.endsWith('/projects')?[record]:record));});vi.stubGlobal('fetch',fetcher);document.body.append(await composePage());
+    for(const action of ['read-and-edit-files','validate','deploy','stop','down']){const control=document.querySelector(`[data-action="${action}"]`) as any;expect(control.disabled).toBe(true);control.click();}expect(fetcher).toHaveBeenCalledTimes(1);
+    await click('Revisions');const revisions=document.querySelector('md-dialog')!;expect((revisions.querySelector('[data-action="restore"]') as any).disabled).toBe(true);await click('Close',revisions);
+    await click('Recover files');const recovery=document.querySelector('md-dialog')!;expect(recovery.textContent).toContain('Production');expect(recovery.textContent).toContain('/srv/project');expect(recovery.textContent).toContain('project-one');await click('Recover files',recovery);expect(fetcher.mock.calls.some(call=>call[0].endsWith('/recover'))).toBe(false);
+    (recovery.querySelector('md-outlined-text-field') as any).value='RECOVER';await click('Recover files',recovery);const call=fetcher.mock.calls.find(call=>call[0].endsWith('/recover'));expect(call?.[0]).toBe('/api/v1/engine/compose/projects/project-one/recover');expect(call?.[1].method).toBe('POST');expect((document.querySelector('[data-action="deploy"]') as any).disabled).toBe(false);expect(document.querySelector('[data-action="recover-files"]')).toBeNull();
+  });
+  it('preserves an open Compose draft and disables Save when pending recovery appears',async()=>{
+    const project={id:'project-one',hostId:'host & one',name:'Production',path:'/srv/project'};const fetcher=vi.fn().mockImplementation((path:string)=>Promise.resolve(response(path.endsWith('/projects')?[project]:path.endsWith('/files')?{compose:'services: {}',environment:'NAME=value'}:{...project,pending:{state:'recovery_required'}})));vi.stubGlobal('fetch',fetcher);document.body.append(await composePage());await click('Read and edit files');const editor=document.querySelector('md-dialog')!;const yaml=editor.querySelector('md-outlined-text-field') as any;yaml.value='my unsaved draft';await click('Save',editor);expect(yaml.value).toBe('my unsaved draft');expect(yaml.readOnly).toBe(true);expect((editor.querySelector('[data-action="save"]') as any).disabled).toBe(true);expect(fetcher.mock.calls.some(call=>call[1].method==='PUT')).toBe(false);
+  });
   it('does not offer the synthetic local engine as an SSH execution target',()=>{state.hosts=[{id:'local',name:'Local engine',address:'',user:'',port:0,credentialId:''}];state.hostId='local';const targets=hostChoices();expect(targets.node.querySelector('md-checkbox')).toBeNull();expect(targets.node.textContent).toContain('engine-only');expect(()=>targets.read()).toThrow('Choose at least one host');});
   it("tests a stored host with POST and offers explicit key enrollment", async () => {
     const fetcher = vi
