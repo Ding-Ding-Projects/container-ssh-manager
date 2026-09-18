@@ -1,6 +1,6 @@
 # Implementation handoff
 
-Status: integrated implementation remains in progress. The completed feature work is on `main` and has been pushed to `origin/main`; deployment and release work were not performed.
+Status: integrated implementation remains in progress. The completed feature work and this handoff are on `main`; deployment and release work were not performed.
 
 ## Integrated commits
 
@@ -22,9 +22,20 @@ Status: integrated implementation remains in progress. The completed feature wor
 
 - `npm ci --prefix web`: completed successfully, 57 packages added, 0 vulnerabilities reported.
 - `npm run build --prefix web`: completed successfully with the existing Vite chunk-size warning.
-- The combined `go test ./...` and `go build ./cmd/manager` command did not produce a terminal verdict while concurrent local build processes were present. The verification shell was stopped after the bounded wait. No Go pass is claimed.
-- Before cleanup, rerun the Go tests and build on a quiet checkout, then record the exact results here.
+- The first combined Go verification attempt was interrupted after concurrent local build processes produced no terminal verdict. It was not used as evidence.
+- On the quiet integrated checkout, `go test ./... -count=1 -timeout=5m` passed with exit `0` for `internal/auth`, `internal/connection`, `internal/core`, `internal/engine`, and `internal/jobs`; command and web packages reported no test files.
+- `go build ./cmd/manager` passed with exit `0` on the same integrated checkout.
+
+## Archive and cleanup evidence
+
+- Verified archive: `C:\Users\cntow\OneDrive\OakKayBackups\container-ssh-manager\zips\container-ssh-manager-20260918T170147Z.7z`.
+- Archive size: 566,350 bytes. `7z t` completed with exit `0`; the archive contains 540 files and 229 folders, including a non-empty `.git`, `HANDOFF.md`, and `ROADMAP.md`.
+- Source inventory was 85 tracked files and 0 untracked non-ignored files. Ignored paths were excluded by Git rules.
+- Before cleanup, `feature/connections`, `feature/engine`, `feature/jobs`, and `feature/ui` each matched its dewed hui ref and each local and hui tip was proven an ancestor of dewed `origin/main` at `af61150faca4797ad5fa2c60c2e2365981ae2ecc`.
+- No load-bearing workflow reference named those feature jers. No Lap Sap Tongs were present.
+- Removed linked Gerk Tong Huis and matching local and hui jers: connections at `985d5c4`, engine at `c73cd5d`, jobs at `96160ea`, and UI at `fc7ba28`.
+- Retained: the primary checkout on `main`, the local `main` jer, and the hui's `main` ref. No other active, user-owned, load-bearing, unmerged, undewed, or ownership-uncertain item was found.
 
 ## Remaining work
 
-Complete SSH, container, Compose, scheduling, browser, runtime, deployment, accessibility, and release verification described in `ROADMAP.md`. Do not infer runtime correctness from compilation or the frontend build alone.
+Complete SSH, container, Compose, scheduling, browser, runtime, deployment, accessibility, and release verification described in `ROADMAP.md`. The local Go Chuts are green on the integrated commit, but runtime deployment and release evidence remain open.
