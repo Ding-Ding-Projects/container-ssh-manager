@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/connection"
 	"github.com/Ding-Ding-Projects/container-ssh-manager/internal/core"
@@ -21,10 +22,18 @@ type Manager struct {
 	store       *core.Store
 	connections *connection.Manager
 	vault       *core.Vault
+	operationMu sync.Mutex
+	active      map[string]context.CancelFunc
+	recoveryErr error
+	recreateMu  sync.Mutex
+	composeMu   sync.Mutex
+	fileWriter  composeFileWriter
 }
 
 func New(store *core.Store, connections *connection.Manager, vault *core.Vault) *Manager {
-	return &Manager{store: store, connections: connections, vault: vault}
+	m := &Manager{store: store, connections: connections, vault: vault, active: make(map[string]context.CancelFunc), fileWriter: connections}
+	m.recoveryErr = m.recoverOperations()
+	return m
 }
 
 func (m *Manager) Register(mux *http.ServeMux) { mux.HandleFunc("/api/v1/engine/", m.serve) }
@@ -37,6 +46,10 @@ func (m *Manager) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(p, "compose/") {
 		m.compose(w, r, strings.TrimPrefix(p, "compose/"))
+		return
+	}
+	if p == "operations" {
+		m.operation(w, r, "")
 		return
 	}
 	if strings.HasPrefix(p, "operations/") {
@@ -74,6 +87,11 @@ func (m *Manager) docker(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 	apiPath, method, stream, err := dockerRoute(r.Method, parts, r.URL.Query())
+	if err != nil {
+		core.Error(w, 400, err.Error())
+		return
+	}
+	apiPath, body, err = translatePayload(parts, method, apiPath, body)
 	if err != nil {
 		core.Error(w, 400, err.Error())
 		return
@@ -135,6 +153,14 @@ func (m *Manager) execContainer(w http.ResponseWriter, r *http.Request, hostID, 
 		core.Error(w, 502, "container exec outcome is unknown")
 		return
 	}
+	if !in.TTY {
+		var decoded bytes.Buffer
+		if err := copyDockerOutput(&decoded, bytes.NewReader(output)); err != nil {
+			core.Error(w, 502, "container exec output interrupted")
+			return
+		}
+		output = decoded.Bytes()
+	}
 	core.JSON(w, 200, map[string]any{"id": createdBody.ID, "exitCode": *state.ExitCode, "output": string(output)})
 }
 
@@ -144,6 +170,7 @@ func (m *Manager) engineJSON(ctx context.Context, hostID, method, path string, b
 		return nil, 502, err
 	}
 	defer closer.Close()
+	defer client.CloseIdleConnections()
 	u, err := url.Parse(base)
 	if err != nil {
 		return nil, 502, err
@@ -166,7 +193,13 @@ func (m *Manager) engineJSON(ctx context.Context, hostID, method, path string, b
 		return nil, 502, err
 	}
 	defer resp.Body.Close()
-	out, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	out, readErr := io.ReadAll(io.LimitReader(resp.Body, (8<<20)+1))
+	if readErr != nil {
+		return nil, 502, readErr
+	}
+	if len(out) > 8<<20 {
+		return nil, 502, fmt.Errorf("engine response exceeds limit")
+	}
 	if resp.StatusCode >= 400 {
 		return out, resp.StatusCode, fmt.Errorf("engine status %d", resp.StatusCode)
 	}
@@ -180,6 +213,7 @@ func (m *Manager) proxy(w http.ResponseWriter, r *http.Request, hostID, method, 
 		return
 	}
 	defer closer.Close()
+	defer client.CloseIdleConnections()
 	u, err := url.Parse(base)
 	if err != nil {
 		core.Error(w, 502, "invalid engine transport")
@@ -212,6 +246,25 @@ func (m *Manager) proxy(w http.ResponseWriter, r *http.Request, hostID, method, 
 	}
 	if stream {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if strings.Contains(apiPath, "/logs?") {
+			id := strings.Split(strings.TrimPrefix(apiPath, "/containers/"), "/")[0]
+			state, inspectErr := m.inspectContainer(r.Context(), hostID, id)
+			if inspectErr != nil {
+				core.Error(w, 502, "cannot determine container log encoding")
+				return
+			}
+			var tty bool
+			if value, ok := state.Config["Tty"]; ok {
+				_ = json.Unmarshal(value, &tty)
+			}
+			w.WriteHeader(resp.StatusCode)
+			if tty {
+				_, _ = io.Copy(w, resp.Body)
+			} else {
+				_ = copyDockerOutput(w, resp.Body)
+			}
+			return
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 		return
@@ -236,7 +289,10 @@ func hostAndBody(r *http.Request) (string, []byte, error) {
 	if r.Body == nil {
 		return host, nil, nil
 	}
-	b, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	b, err := io.ReadAll(io.LimitReader(r.Body, (8<<20)+1))
+	if len(b) > 8<<20 {
+		return "", nil, fmt.Errorf("request body exceeds limit")
+	}
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid request body")
 	}
@@ -274,7 +330,7 @@ func dockerRoute(method string, p []string, q url.Values) (string, string, bool,
 	id := ""
 	if len(p) > 1 {
 		id = p[1]
-		if id == "" || strings.ContainsAny(id, "/\\") {
+		if !safeRecordID(id) {
 			return "", "", false, fmt.Errorf("invalid resource id")
 		}
 	}
