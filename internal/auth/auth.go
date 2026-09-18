@@ -166,6 +166,9 @@ func (a *Auth) valid(r *http.Request) bool {
 	var s session
 	return a.Store.Get("session", key(c.Value), &s) == nil && time.Now().Before(s.Expires)
 }
+func (a *Auth) Session(w http.ResponseWriter, r *http.Request) {
+	core.JSON(w, 200, map[string]bool{"authenticated": a.valid(r)})
+}
 func (a *Auth) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -181,7 +184,7 @@ func (a *Auth) Wrap(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/v1/health" && r.URL.Path != "/api/v1/version" && r.URL.Path != "/api/v1/login" && !a.valid(r) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/v1/health" && r.URL.Path != "/api/v1/version" && r.URL.Path != "/api/v1/login" && r.URL.Path != "/api/v1/session" && !a.valid(r) {
 			core.Error(w, 401, "Sign in required")
 			return
 		}

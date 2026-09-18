@@ -166,9 +166,7 @@ func run() error {
 	})
 	mux.HandleFunc("POST /api/v1/login", a.Login)
 	mux.HandleFunc("POST /api/v1/logout", a.Logout)
-	mux.HandleFunc("GET /api/v1/session", func(w http.ResponseWriter, r *http.Request) {
-		core.JSON(w, 200, map[string]bool{"authenticated": true})
-	})
+	mux.HandleFunc("GET /api/v1/session", a.Session)
 	c := connection.New(s, vault)
 	c.AllowedOrigin = origin
 	defer c.Close()
