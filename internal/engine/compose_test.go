@@ -3,6 +3,7 @@ package engine
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 )
 
@@ -21,7 +22,7 @@ func TestComposeDeployUsesOnlyControlledFlags(t *testing.T) {
 }
 
 func TestComposePathValidation(t *testing.T) {
-	if safeComposePath("relative/path") || safeComposePath("C:\\") || !safeComposePath("C:\\srv\\app") {
+	if safeComposePath("relative/path") || !safeComposePath(filepath.Join(t.TempDir(), "app")) {
 		t.Fatal("unexpected path validation result")
 	}
 }

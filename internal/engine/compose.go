@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -20,15 +21,17 @@ type composeProject struct {
 	HostID    string            `json:"hostId"`
 	Name      string            `json:"name"`
 	Path      string            `json:"path"`
+	FileName  string            `json:"fileName,omitempty"`
 	Adopted   bool              `json:"adopted"`
 	CreatedAt time.Time         `json:"createdAt"`
 	UpdatedAt time.Time         `json:"updatedAt"`
 	Revisions []composeRevision `json:"revisions"`
+	Pending   *composeWrite     `json:"pending,omitempty"`
 }
 type composeRevision struct {
 	Number    int       `json:"number"`
 	CreatedAt time.Time `json:"createdAt"`
-	Sealed    string    `json:"-"`
+	Sealed    string    `json:"sealed,omitempty"`
 }
 type composeFiles struct {
 	Compose     string `json:"compose"`
@@ -47,6 +50,8 @@ type composeDeploy struct {
 }
 
 func (m *Manager) compose(w http.ResponseWriter, r *http.Request, path string) {
+	m.composeMu.Lock()
+	defer m.composeMu.Unlock()
 	if m.store == nil || m.vault == nil {
 		core.Error(w, 503, "sealed compose storage is unavailable")
 		return
@@ -72,11 +77,35 @@ func (m *Manager) compose(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 	if len(p) == 2 && r.Method == http.MethodGet {
-		core.JSON(w, 200, project)
+		core.JSON(w, 200, publicCompose(project))
+		return
+	}
+	if len(p) == 3 && p[2] == "files" && r.Method == http.MethodGet {
+		if len(project.Revisions) == 0 {
+			core.Error(w, 404, "no saved compose revision")
+			return
+		}
+		files, err := m.openRevision(project.Revisions[len(project.Revisions)-1])
+		if err != nil {
+			core.Error(w, 500, "stored compose revision cannot be opened")
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		core.JSON(w, 200, files)
 		return
 	}
 	if len(p) == 3 && p[2] == "files" && r.Method == http.MethodPut {
 		m.saveFiles(w, r, &project)
+		return
+	}
+	if len(p) == 3 && p[2] == "recover" && r.Method == http.MethodPost {
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		if err := m.recoverComposeWrite(ctx, &project); err != nil {
+			core.Error(w, 409, err.Error())
+			return
+		}
+		core.JSON(w, 200, map[string]bool{"ok": true})
 		return
 	}
 	if len(p) == 3 && (p[2] == "validate" || p[2] == "deploy" || p[2] == "stop" || p[2] == "down") && r.Method == http.MethodPost {
@@ -99,7 +128,7 @@ func (m *Manager) listCompose(w http.ResponseWriter) {
 	for _, row := range rows {
 		var p composeProject
 		if json.Unmarshal(row, &p) == nil {
-			out = append(out, p)
+			out = append(out, publicCompose(p))
 		}
 	}
 	core.JSON(w, 200, out)
@@ -110,17 +139,59 @@ func (m *Manager) createCompose(w http.ResponseWriter, r *http.Request) {
 		core.Error(w, 400, "invalid compose project")
 		return
 	}
+	if in.HostID != "local" && !pathpkg.IsAbs(in.Path) {
+		core.Error(w, 400, "remote compose path must be an absolute POSIX path")
+		return
+	}
 	now := time.Now().UTC()
-	p := composeProject{ID: core.ID(), HostID: in.HostID, Name: in.Name, Path: filepath.Clean(in.Path), Adopted: in.Adopt, CreatedAt: now, UpdatedAt: now}
+	cleanPath := filepath.Clean(in.Path)
+	if in.HostID != "local" {
+		cleanPath = pathpkg.Clean(in.Path)
+	}
+	p := composeProject{ID: core.ID(), HostID: in.HostID, Name: in.Name, Path: cleanPath, Adopted: in.Adopt, CreatedAt: now, UpdatedAt: now}
+	if in.Adopt {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		files, fileName, err := m.readComposeProject(ctx, p.HostID, p.Path)
+		if err != nil {
+			core.Error(w, 400, err.Error())
+			return
+		}
+		plain, err := json.Marshal(files)
+		if err != nil {
+			core.Error(w, 500, "cannot encode compose revision")
+			return
+		}
+		defer clearBytes(plain)
+		sealed, err := m.vault.Seal(plain)
+		if err != nil {
+			core.Error(w, 500, "cannot seal compose revision")
+			return
+		}
+		p.FileName = fileName
+		p.Revisions = []composeRevision{{Number: 1, CreatedAt: now, Sealed: base64.StdEncoding.EncodeToString(sealed)}}
+	}
 	if m.store.Put(composeKind, p.ID, p) != nil {
 		core.Error(w, 500, "cannot save compose project")
 		return
 	}
-	core.JSON(w, 201, p)
+	core.JSON(w, 201, publicCompose(p))
 }
 func (m *Manager) loadCompose(id string) (composeProject, error) {
 	var p composeProject
-	return p, m.store.Get(composeKind, id, &p)
+	err := m.store.Get(composeKind, id, &p)
+	return p, err
+}
+
+func publicCompose(p composeProject) composeProject {
+	p.Revisions = append([]composeRevision(nil), p.Revisions...)
+	for i := range p.Revisions {
+		p.Revisions[i].Sealed = ""
+	}
+	if p.Pending != nil {
+		p.Pending = &composeWrite{State: "recovery_required"}
+	}
+	return p
 }
 func (m *Manager) saveFiles(w http.ResponseWriter, r *http.Request, p *composeProject) {
 	var f composeFiles
@@ -129,22 +200,16 @@ func (m *Manager) saveFiles(w http.ResponseWriter, r *http.Request, p *composePr
 		return
 	}
 	plain, _ := json.Marshal(f)
+	defer clearBytes(plain)
 	sealed, err := m.vault.Seal(plain)
 	if err != nil {
 		core.Error(w, 500, "cannot seal compose revision")
 		return
 	}
-	// Write before recording the revision so a successful response always names a
-	// revision that exists on the selected host. The connection manager performs an
-	// atomic SFTP rename and rejects unsafe remote paths.
-	if err := m.writeComposeFiles(r.Context(), p, f); err != nil {
-		core.Error(w, 502, "cannot write compose files")
-		return
-	}
-	p.Revisions = append(p.Revisions, composeRevision{Number: len(p.Revisions) + 1, CreatedAt: time.Now().UTC(), Sealed: base64.StdEncoding.EncodeToString(sealed)})
-	p.UpdatedAt = time.Now().UTC()
-	if m.store.Put(composeKind, p.ID, p) != nil {
-		core.Error(w, 500, "cannot save compose revision")
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	if err := m.commitComposeRevision(ctx, p, f, base64.StdEncoding.EncodeToString(sealed)); err != nil {
+		core.Error(w, 409, err.Error())
 		return
 	}
 	core.JSON(w, 200, map[string]int{"revision": len(p.Revisions)})
@@ -161,19 +226,13 @@ func (m *Manager) restoreCompose(w http.ResponseWriter, r *http.Request, p *comp
 		core.Error(w, 500, "stored compose revision cannot be opened")
 		return
 	}
-	if err := m.writeComposeFiles(r.Context(), p, files); err != nil {
-		core.Error(w, 502, "cannot restore compose files")
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	if err := m.commitComposeRevision(ctx, p, files, revision.Sealed); err != nil {
+		core.Error(w, 409, err.Error())
 		return
 	}
-	revision.Number = len(p.Revisions) + 1
-	revision.CreatedAt = time.Now().UTC()
-	p.Revisions = append(p.Revisions, revision)
-	p.UpdatedAt = time.Now().UTC()
-	if m.store.Put(composeKind, p.ID, p) != nil {
-		core.Error(w, 500, "cannot restore compose revision")
-		return
-	}
-	core.JSON(w, 200, map[string]int{"revision": revision.Number})
+	core.JSON(w, 200, map[string]int{"revision": len(p.Revisions)})
 }
 
 func (m *Manager) openRevision(revision composeRevision) (composeFiles, error) {
@@ -187,17 +246,17 @@ func (m *Manager) openRevision(revision composeRevision) (composeFiles, error) {
 		return out, err
 	}
 	defer clearBytes(plain)
-	return out, json.Unmarshal(plain, &out)
+	err = json.Unmarshal(plain, &out)
+	return out, err
 }
 
 func (m *Manager) writeComposeFiles(ctx context.Context, p *composeProject, files composeFiles) error {
-	if err := m.connections.WriteComposeFile(ctx, p.HostID, p.Path, "compose.yaml", []byte(files.Compose)); err != nil {
+	if err := m.fileWriter.WriteComposeFile(ctx, p.HostID, p.Path, projectComposeFile(p), []byte(files.Compose)); err != nil {
 		return err
 	}
-	if files.Environment != "" {
-		return m.connections.WriteComposeFile(ctx, p.HostID, p.Path, ".env", []byte(files.Environment))
-	}
-	return nil
+	// Empty input deliberately clears the old environment instead of silently
+	// reusing credentials from the previous revision.
+	return m.fileWriter.WriteComposeFile(ctx, p.HostID, p.Path, ".env", []byte(files.Environment))
 }
 
 func clearBytes(b []byte) {
@@ -206,49 +265,93 @@ func clearBytes(b []byte) {
 	}
 }
 func (m *Manager) runCompose(w http.ResponseWriter, r *http.Request, p *composeProject, action string) {
-	cmd := composeCommand(p.Path, action, r)
-	if cmd == "" {
+	if p.Pending != nil {
+		core.Error(w, 409, "compose file recovery is required before deployment or lifecycle commands")
+		return
+	}
+	args := composeArgsForFile(p.Path, projectComposeFile(p), action, r)
+	if args == nil {
 		core.Error(w, 400, "invalid compose operation")
 		return
 	}
-	status, err := m.connections.Run(context.Background(), p.HostID, cmd)
+	op, ctx, err := m.beginOperation(p.HostID, "compose-"+action, 30*time.Minute)
 	if err != nil {
-		core.Error(w, 502, "compose operation interrupted; outcome is unknown")
+		core.Error(w, 503, "cannot persist compose operation")
+		return
+	}
+	// Preserve the synchronous success shape while recording interruption and
+	// restart recovery through the same durable operation endpoint.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(r.Context(), cancel)
+	defer stop()
+	status, err := m.runDockerCommand(ctx, p.HostID, args)
+	if err != nil {
+		m.finishOperation(op, ctx, "unknown", "compose operation interrupted; outcome is unknown")
+		core.JSON(w, 502, map[string]any{"error": "compose operation interrupted; outcome is unknown", "operationId": op.ID})
 		return
 	}
 	if status != 0 {
-		core.Error(w, 502, "compose operation failed")
+		m.finishOperation(op, ctx, "failed", "compose command exited unsuccessfully")
+		core.JSON(w, 502, map[string]any{"error": "compose operation failed", "operationId": op.ID})
 		return
 	}
-	core.JSON(w, 200, map[string]bool{"ok": true})
+	m.finishOperation(op, ctx, "completed", "")
+	core.JSON(w, 200, map[string]any{"ok": true, "operationId": op.ID})
 }
 func composeCommand(path, action string, r *http.Request) string {
-	base := "docker compose --project-directory " + shellQuote(path) + " -f " + shellQuote(filepath.Join(path, "compose.yaml")) + " "
+	args := composeArgs(path, action, r)
+	if args == nil {
+		return ""
+	}
+	for i := range args {
+		args[i] = shellQuote(args[i])
+	}
+	return "docker " + strings.Join(args, " ")
+}
+func composeArgs(path, action string, r *http.Request) []string {
+	return composeArgsForFile(path, "compose.yaml", action, r)
+}
+func projectComposeFile(p *composeProject) string {
+	if p.FileName == "compose.yml" {
+		return "compose.yml"
+	}
+	return "compose.yaml"
+}
+func composeArgsForFile(path, fileName, action string, r *http.Request) []string {
+	file := filepath.Join(path, fileName)
+	if pathpkg.IsAbs(path) {
+		file = pathpkg.Join(path, fileName)
+	}
+	base := []string{"compose", "--project-directory", path, "-f", file}
 	switch action {
 	case "validate":
-		return base + "config --quiet"
+		return append(base, "config", "--quiet")
 	case "stop":
-		return base + "stop"
+		return append(base, "stop")
 	case "down":
-		return base + "down"
+		return append(base, "down")
 	case "deploy":
 		var d composeDeploy
 		if core.Decode(r, &d) != nil {
-			return ""
+			return nil
 		}
-		a := "up"
+		a := append(base, "up")
 		if d.Pull {
-			a += " --pull always"
+			a = append(a, "--pull", "always")
 		}
 		if d.Build {
-			a += " --build"
+			a = append(a, "--build")
 		}
 		if d.Detach == nil || *d.Detach {
-			a += " --detach"
+			a = append(a, "--detach")
 		}
-		return base + a
+		if d.Detach != nil && !*d.Detach {
+			return nil
+		}
+		return a
 	}
-	return ""
+	return nil
 }
 func shellQuote(v string) string { return "'" + strings.ReplaceAll(v, "'", "'\\''") + "'" }
 func safeRecordID(v string) bool {
@@ -258,5 +361,8 @@ func safeName(v string) bool {
 	return v != "" && len(v) <= 128 && !strings.ContainsAny(v, "/\\\x00\r\n")
 }
 func safeComposePath(v string) bool {
-	return filepath.IsAbs(v) && v != filepath.VolumeName(v)+"\\" && !strings.ContainsAny(v, "\x00\r\n")
+	if strings.ContainsAny(v, "\x00\r\n") || v == "/" || v == "\\" {
+		return false
+	}
+	return (filepath.IsAbs(v) || pathpkg.IsAbs(v)) && filepath.Clean(v) != filepath.VolumeName(v)+"\\"
 }
