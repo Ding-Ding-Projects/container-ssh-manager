@@ -9,6 +9,7 @@ import {
   positiveInteger,
   objectJSON,
   refreshLocalizedControls,
+  notify,
 } from "./ui";
 import { APIError, request, url, engineURL, list } from "./api";
 import { readPreferences, state } from "./state";
@@ -59,6 +60,9 @@ const click = async (label: string, scope: ParentNode = document) => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 };
 describe("safe components and dialog actions", () => {
+  it('coalesces repeated information and keeps a bounded queue',()=>{for(let count=0;count<8;count++)notify('Preferences saved');expect(document.querySelectorAll('.notice')).toHaveLength(1);for(let count=0;count<8;count++)notify('Information '+count);expect(document.querySelectorAll('.notice')).toHaveLength(4);});
+  it('expires information but keeps errors until dismissed',()=>{vi.useFakeTimers();try{notify('Saved');notify('Unable to save',true);vi.advanceTimersByTime(8000);expect(document.querySelectorAll('.notice')).toHaveLength(1);expect(document.querySelector('[role=alert]')?.textContent).toContain('Unable to save');vi.advanceTimersByTime(60000);expect(document.querySelector('[role=alert]')).not.toBeNull();}finally{vi.useRealTimers();}});
+  it('does not evict persistent errors to show routine information',()=>{for(let count=0;count<4;count++)notify('Error '+count,true);notify('Preferences saved');expect(document.querySelectorAll('[role=alert]')).toHaveLength(4);expect(document.querySelector('[role=status]')).toBeNull();});
   it("updates existing labels in Cantonese and bilingual modes and restores English", () => {
     const action = button("Save", () => {}),
       input = field("Name");
